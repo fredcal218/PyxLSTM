@@ -176,4 +176,4 @@ tests/
 
 E-DAIC/
 output/
-depression_prediction/# Code Citations.md
+depression_prediction/*.md

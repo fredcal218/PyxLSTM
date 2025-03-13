@@ -22,7 +22,7 @@ from depression_prediction.utils import set_seed, get_feature_dimension
 
 # Import for mixed precision training
 try:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import autocast, GradScaler
     AMP_AVAILABLE = True
 except ImportError:
     AMP_AVAILABLE = False
@@ -33,17 +33,27 @@ def train_epoch(model, data_loader, criterion, optimizer, device, scaler=None, g
     """Train the model for one epoch."""
     model.train()
     total_loss = 0
-    nan_encountered = False
+    batch_count = 0
+    nan_batch_count = 0
     
     # Add progress bar for batches
     progress_bar = tqdm(data_loader, desc="Training batches", leave=False)
     
     for features, labels in progress_bar:
-        features = features.to(device)
-        labels = labels.to(device)
+        # Skip empty batches
+        if features.size(0) == 0:
+            continue
+            
+        features = features.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        
+        # Extra guard against NaN inputs
+        if torch.isnan(features).any() or torch.isinf(features).any():
+            nan_batch_count += 1
+            features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Clear gradients
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # Slightly more efficient
         
         # Use mixed precision if available
         if scaler is not None:
@@ -53,8 +63,8 @@ def train_epoch(model, data_loader, criterion, optimizer, device, scaler=None, g
                 
             # Check for NaN loss
             if torch.isnan(loss).any() or torch.isinf(loss).any():
-                nan_encountered = True
-                progress_bar.write("NaN/Inf loss detected, skipping batch")
+                nan_batch_count += 1
+                progress_bar.set_postfix(loss="NaN/Inf")
                 continue
                 
             # Scale loss and calculate gradients
@@ -75,8 +85,8 @@ def train_epoch(model, data_loader, criterion, optimizer, device, scaler=None, g
             
             # Check for NaN loss
             if torch.isnan(loss).any() or torch.isinf(loss).any():
-                nan_encountered = True
-                progress_bar.write("NaN/Inf loss detected, skipping batch")
+                nan_batch_count += 1
+                progress_bar.set_postfix(loss="NaN/Inf")
                 continue
                 
             # Calculate gradients
@@ -91,21 +101,29 @@ def train_epoch(model, data_loader, criterion, optimizer, device, scaler=None, g
         
         current_loss = loss.item()
         total_loss += current_loss
+        batch_count += 1
         
-        # Free memory
-        torch.cuda.empty_cache()
+        # Free memory explicitly
+        del features, labels, outputs, loss
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         # Update progress bar description with current loss
         progress_bar.set_postfix(loss=f"{current_loss:.4f}")
     
-    # Return average loss and NaN flag
-    return total_loss / len(data_loader), nan_encountered
+    # Check if all batches were NaNs
+    if batch_count == 0:
+        return float('nan'), nan_batch_count
+    
+    # Return average loss and NaN count
+    return total_loss / batch_count, nan_batch_count
 
 
 def evaluate(model, data_loader, criterion, device):
     """Evaluate the model."""
     model.eval()
     total_loss = 0
+    batch_count = 0
     all_preds = []
     all_labels = []
     
@@ -114,23 +132,52 @@ def evaluate(model, data_loader, criterion, device):
     
     with torch.no_grad():
         for features, labels in progress_bar:
-            features = features.to(device)
-            labels = labels.to(device)
+            # Skip empty batches
+            if features.size(0) == 0:
+                continue
+                
+            features = features.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            # Safety check for NaN inputs
+            if torch.isnan(features).any() or torch.isinf(features).any():
+                features = torch.nan_to_num(features)
             
             # Forward pass
             outputs, _ = model(features)
             loss = criterion(outputs, labels)
             
+            # Check for NaN loss
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                continue
+                
             total_loss += loss.item()
-            all_preds.extend(outputs.cpu().numpy())
+            batch_count += 1
+            
+            # Make sure outputs are clean for metrics
+            clean_outputs = torch.nan_to_num(outputs).cpu().numpy()
+            all_preds.extend(clean_outputs)
             all_labels.extend(labels.cpu().numpy())
+            
+            # Free memory
+            del features, labels, outputs
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+    
+    # Handle case where all batches failed
+    if batch_count == 0:
+        return float('nan'), float('nan'), float('nan'), float('nan')
     
     # Calculate evaluation metrics
-    mae = mean_absolute_error(all_labels, all_preds)
-    rmse = np.sqrt(mean_squared_error(all_labels, all_preds))
-    r2 = r2_score(all_labels, all_preds)
+    try:
+        mae = mean_absolute_error(all_labels, all_preds)
+        rmse = np.sqrt(mean_squared_error(all_labels, all_preds))
+        r2 = r2_score(all_labels, all_preds)
+    except:
+        # Handle case where metrics calculation fails
+        mae, rmse, r2 = float('nan'), float('nan'), float('nan')
     
-    return total_loss / len(data_loader), mae, rmse, r2
+    return total_loss / batch_count, mae, rmse, r2
 
 
 def train(args):
@@ -144,7 +191,7 @@ def train(args):
     print(f"Output directory: {args.output_dir}")
     
     # Set up device - Force CUDA if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     if device.type == 'cuda':
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         # Optional: Set this to optimize for your specific GPU
@@ -155,8 +202,9 @@ def train(args):
     # Load data
     print("\n=== Loading data ===")
     start_time = time.time()
+    num_workers = getattr(args, 'num_workers', 0)
     train_loader, dev_loader, test_loader = get_data_loaders(
-        args.data_dir, args.batch_size, args.max_seq_length, args.stride
+        args.data_dir, args.batch_size, args.max_seq_length, args.stride, num_workers
     )
     print(f"Data loading complete in {time.time() - start_time:.2f} seconds!")
     
@@ -193,10 +241,13 @@ def train(args):
     print("\n=== Setting up training components ===")
     criterion = nn.MSELoss()
     print(f"Loss function: MSE")
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    print(f"Optimizer: Adam with learning rate {args.learning_rate}")
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    print("Scheduler: ReduceLROnPlateau with factor 0.5 and patience 3")
+    
+    # Use AdamW instead of Adam (better weight decay handling)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+    print(f"Optimizer: AdamW with learning rate {args.learning_rate} and weight decay 1e-5")
+    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    print("Scheduler: ReduceLROnPlateau with factor 0.5 and patience 2")
     
     # Set up gradient clipping
     gradient_clip = getattr(args, 'gradient_clip', None)
@@ -221,8 +272,21 @@ def train(args):
     # Training loop
     print("\n=== Starting Training ===")
     best_dev_loss = float('inf')
+    best_dev_mae = float('inf')
     best_model_path = os.path.join(args.output_dir, "best_model.pt")
     consecutive_nan_epochs = 0
+    
+    # Early stopping setup
+    early_stopping = getattr(args, 'early_stopping', False)
+    early_stopping_patience = getattr(args, 'early_stopping_patience', 5)
+    early_stopping_metric = getattr(args, 'early_stopping_metric', 'mae')
+    no_improvement_count = 0
+    best_metric_value = float('inf')  # For metrics where lower is better (loss, mae, rmse)
+    
+    print(f"Early stopping: {'Enabled' if early_stopping else 'Disabled'}")
+    if early_stopping:
+        print(f"  Patience: {early_stopping_patience} epochs")
+        print(f"  Early Stopping Metric: {early_stopping_metric}")
     
     # Create progress bar for epochs
     epochs_progress = tqdm(range(args.num_epochs), desc="Training epochs", unit="epoch")
@@ -231,13 +295,13 @@ def train(args):
         start_time = time.time()
         
         # Train
-        train_loss, nan_encountered = train_epoch(
+        train_loss, nan_batch_count = train_epoch(
             model, train_loader, criterion, optimizer, device, 
             scaler=scaler, gradient_clip=gradient_clip
         )
         
         # Check for NaN in training loss
-        if nan_encountered or np.isnan(train_loss) or np.isinf(train_loss):
+        if np.isnan(train_loss) or np.isinf(train_loss):
             consecutive_nan_epochs += 1
             epochs_progress.write(f"Warning: NaN/Inf detected in epoch {epoch+1}. ({consecutive_nan_epochs} consecutive)")
             
@@ -256,6 +320,10 @@ def train(args):
             continue
         else:
             consecutive_nan_epochs = 0
+            
+        # Report NaN batch statistics
+        if nan_batch_count > 0:
+            epochs_progress.write(f"  {nan_batch_count} batches with NaN/Inf were skipped")
         
         # Evaluate on dev set
         dev_loss, dev_mae, dev_rmse, dev_r2 = evaluate(model, dev_loader, criterion, device)
@@ -274,14 +342,46 @@ def train(args):
                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                 'train_loss': train_loss,
                 'dev_loss': dev_loss,
+                'dev_mae': dev_mae,
             }, checkpoint_path)
             epochs_progress.write(f"  Checkpoint saved at epoch {epoch+1}")
         
-        # Save best model
-        if dev_loss < best_dev_loss:
+        # Save best model based on dev loss
+        if not np.isnan(dev_loss) and dev_loss < best_dev_loss:
             best_dev_loss = dev_loss
             torch.save(model.state_dict(), best_model_path)
             epochs_progress.write(f"  New best model saved with dev loss: {dev_loss:.4f}")
+        
+        # Save best model based on dev MAE (useful for regression tasks)
+        if not np.isnan(dev_mae) and dev_mae < best_dev_mae:
+            best_dev_mae = dev_mae
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_mae_model.pt"))
+            epochs_progress.write(f"  New best MAE model saved with dev MAE: {dev_mae:.4f}")
+        
+        # Early stopping check
+        if early_stopping:
+            # Get current metric value based on the selected metric
+            if early_stopping_metric == 'loss':
+                current_metric = dev_loss
+            elif early_stopping_metric == 'mae':
+                current_metric = dev_mae
+            elif early_stopping_metric == 'rmse':
+                current_metric = dev_rmse
+            elif early_stopping_metric == 'r2':
+                current_metric = -dev_r2  # Negative because for R2, higher is better
+            
+            # Check if there's improvement
+            if np.isnan(current_metric) or current_metric >= best_metric_value:
+                no_improvement_count += 1
+                if no_improvement_count >= early_stopping_patience:
+                    epochs_progress.write(f"\nEarly stopping triggered! No improvement in {early_stopping_metric} "
+                                         f"for {early_stopping_patience} epochs.")
+                    break
+            else:
+                # There is improvement
+                best_metric_value = current_metric
+                no_improvement_count = 0
+                epochs_progress.write(f"  New best {early_stopping_metric}: {current_metric:.4f}")
         
         # Log metrics
         elapsed_time = time.time() - start_time
@@ -306,31 +406,42 @@ def train(args):
         writer.add_scalar("Metrics/dev_r2", dev_r2, epoch)
         writer.add_scalar("LR", optimizer.param_groups[0]['lr'], epoch)
     
-    # Evaluate on test set using best model
-    model.load_state_dict(torch.load(best_model_path))
-    test_loss, test_mae, test_rmse, test_r2 = evaluate(model, test_loader, criterion, device)
+    # Check if we have a valid best model
+    if not os.path.exists(best_model_path):
+        print("\nNo valid model was saved during training. Saving the final model instead.")
+        torch.save(model.state_dict(), os.path.join(args.output_dir, "final_model.pt"))
+        best_model_path = os.path.join(args.output_dir, "final_model.pt")
     
-    print("\nTest Results:")
-    print(f"  Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}")
+    # Evaluate on test set using best model if available
+    try:
+        model.load_state_dict(torch.load(best_model_path, weights_only=True))
+        test_loss, test_mae, test_rmse, test_r2 = evaluate(model, test_loader, criterion, device)
+        
+        print("\nTest Results:")
+        print(f"  Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}")
+        
+        # Save final metrics
+        metrics = {
+            "test_loss": test_loss,
+            "test_mae": test_mae,
+            "test_rmse": test_rmse,
+            "test_r2": test_r2
+        }
+        
+        writer.add_hparams(
+            {"hidden_size": args.hidden_size,
+             "num_layers": args.num_layers,
+             "num_blocks": args.num_blocks,
+             "lstm_type": args.lstm_type,
+             "dropout": args.dropout,
+             "lr": args.learning_rate},
+            metrics
+        )
+    except Exception as e:
+        print(f"\nFailed to evaluate on test set: {e}")
     
-    # Save final metrics
-    metrics = {
-        "test_loss": test_loss,
-        "test_mae": test_mae,
-        "test_rmse": test_rmse,
-        "test_r2": test_r2
-    }
-    
-    writer.add_hparams(
-        {"hidden_size": args.hidden_size,
-         "num_layers": args.num_layers,
-         "num_blocks": args.num_blocks,
-         "lstm_type": args.lstm_type,
-         "dropout": args.dropout,
-         "lr": args.learning_rate},
-        metrics
-    )
     writer.close()
+    print("\nTraining completed!")
 
 
 if __name__ == "__main__":
@@ -369,6 +480,14 @@ if __name__ == "__main__":
                         help="Enable mixed precision training")
     parser.add_argument("--checkpoint_interval", type=int, default=10,
                         help="Interval (in epochs) to save checkpoints")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="Number of workers for data loading")
+    parser.add_argument("--early_stopping", action="store_true",
+                        help="Enable early stopping")
+    parser.add_argument("--early_stopping_patience", type=int, default=5,
+                        help="Patience for early stopping")
+    parser.add_argument("--early_stopping_metric", type=str, default="mae", choices=["loss", "mae", "rmse", "r2"],
+                        help="Metric for early stopping")
     
     args = parser.parse_args()
     train(args)

@@ -6,6 +6,7 @@ including seed setting, feature dimension calculation, and model evaluation.
 """
 
 import os
+import gc  # Import at the top to avoid "gc is not defined" error
 import random
 import pandas as pd
 import numpy as np
@@ -70,18 +71,32 @@ def plot_predictions(true_values, predictions, output_path):
         predictions (list): Predicted PHQ-8 scores.
         output_path (str): Path to save the plot.
     """
+    # Clean NaN or Inf values before plotting
+    valid_indices = []
+    for i in range(len(true_values)):
+        if (not np.isnan(true_values[i]) and not np.isnan(predictions[i]) and 
+            not np.isinf(true_values[i]) and not np.isinf(predictions[i])):
+            valid_indices.append(i)
+    
+    if not valid_indices:
+        print("Warning: No valid prediction pairs to plot")
+        return
+        
+    clean_true = [true_values[i] for i in valid_indices]
+    clean_pred = [predictions[i] for i in valid_indices]
+    
     plt.figure(figsize=(10, 6))
-    plt.scatter(true_values, predictions, alpha=0.7)
+    plt.scatter(clean_true, clean_pred, alpha=0.7)
     
     # Add perfect prediction line
-    min_val = min(min(true_values), min(predictions))
-    max_val = max(max(true_values), max(predictions))
+    min_val = min(min(clean_true), min(clean_pred))
+    max_val = max(max(clean_true), max(clean_pred))
     plt.plot([min_val, max_val], [min_val, max_val], 'r--')
     
     # Calculate metrics
-    mae = mean_absolute_error(true_values, predictions)
-    rmse = np.sqrt(mean_squared_error(true_values, predictions))
-    r2 = r2_score(true_values, predictions)
+    mae = mean_absolute_error(clean_true, clean_pred)
+    rmse = np.sqrt(mean_squared_error(clean_true, clean_pred))
+    r2 = r2_score(clean_true, clean_pred)
     
     plt.title(f'True vs Predicted PHQ-8 Scores\nMAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.2f}')
     plt.xlabel('True PHQ-8 Score')
@@ -104,9 +119,32 @@ def compute_confusion_matrix(true_values, predictions, threshold=10):
     Returns:
         dict: Confusion matrix metrics.
     """
+    # Clean NaN or Inf values
+    valid_indices = []
+    for i in range(len(true_values)):
+        if (not np.isnan(true_values[i]) and not np.isnan(predictions[i]) and 
+            not np.isinf(true_values[i]) and not np.isinf(predictions[i])):
+            valid_indices.append(i)
+    
+    if not valid_indices:
+        print("Warning: No valid prediction pairs for confusion matrix")
+        return {
+            'true_positives': 0,
+            'false_positives': 0,
+            'true_negatives': 0,
+            'false_negatives': 0,
+            'accuracy': 0,
+            'precision': 0,
+            'recall': 0,
+            'f1_score': 0
+        }
+        
+    clean_true = [true_values[i] for i in valid_indices]
+    clean_pred = [predictions[i] for i in valid_indices]
+    
     # Convert scores to binary classification (depressed or not)
-    true_binary = [1 if score >= threshold else 0 for score in true_values]
-    pred_binary = [1 if score >= threshold else 0 for score in predictions]
+    true_binary = [1 if score >= threshold else 0 for score in clean_true]
+    pred_binary = [1 if score >= threshold else 0 for score in clean_pred]
     
     # Calculate true positives, false positives, true negatives, false negatives
     tp = sum(1 for t, p in zip(true_binary, pred_binary) if t == 1 and p == 1)
@@ -130,3 +168,29 @@ def compute_confusion_matrix(true_values, predictions, threshold=10):
         'recall': recall,
         'f1_score': f1
     }
+
+
+def print_memory_stats():
+    """Print memory statistics for PyTorch tensors and CUDA if available."""
+    print("\n=== Memory Statistics ===")
+    
+    # Report CUDA memory if available
+    if torch.cuda.is_available():
+        print(f"CUDA allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"CUDA reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+        print(f"CUDA max allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+        print(f"CUDA max reserved: {torch.cuda.max_memory_reserved() / 1024**2:.2f} MB")
+        
+    # Report number of PyTorch tensors
+    total_tensors = 0
+    total_size = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                total_tensors += 1
+                total_size += obj.element_size() * obj.nelement()
+        except:
+            pass
+    
+    print(f"Total tensors: {total_tensors}")
+    print(f"Total tensor memory: {total_size / 1024**2:.2f} MB")

@@ -6,6 +6,7 @@ providing command-line arguments and launching the training process.
 """
 
 import os
+import torch
 from depression_prediction.train import train
 
 
@@ -17,31 +18,50 @@ def main():
             # Data parameters
             self.data_dir = "E-DAIC"
             self.output_dir = "./output"
-            # Reducing sequence length to avoid memory issues
-            self.max_seq_length = 5000  # Reduced from 30000
-            self.stride = 2500         # Reduced from 15000
+            self.max_seq_length = 30000
+            self.stride = 25000
             
-            # Model parameters
-            self.hidden_size = 64      # Reduced from 128
-            self.num_layers = 1        # Reduced from 2
-            self.num_blocks = 1        # Reduced from 2
-            self.lstm_type = "slstm"   # Options: "slstm", "mlstm"
+            # Model Parameters
+            self.hidden_size = 64
+            self.num_layers = 2
+            self.num_blocks = 2
+            self.lstm_type = "slstm"
             self.dropout = 0.2
             
             # Training parameters
-            self.batch_size = 4        # Reduced from 64
-            self.learning_rate = 0.001
+            self.batch_size = 32
+            self.learning_rate = 0.00005
             self.num_epochs = 50
             self.seed = 42
             self.no_cuda = False
             
-            # Memory optimization parameters
-            self.gradient_clip = 1.0   # Add gradient clipping
-            self.checkpoint_interval = 5  # Save every 5 epochs
-            self.mixed_precision = True   # Use mixed precision training
+            # Memory and stability optimization
+            self.gradient_clip = 0.5
+            self.checkpoint_interval = 1
+            self.mixed_precision = True
+            
+            # Early stopping parameters
+            self.early_stopping = True
+            self.early_stopping_patience = 5  
+            self.early_stopping_metric = 'mae'  # Can be 'loss', 'mae', 'rmse', 'r2'
+            
+            # Performance optimization
+            self.num_workers = min(os.cpu_count(), 4)
     
     # Create configuration
     config = Config()
+    
+    # Print system info
+    print("\n=== System Information ===")
+    print(f"PyTorch version: {torch.__version__}")
+    
+    if torch.cuda.is_available():
+        print(f"CUDA available: Yes")
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        print(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.1f} MB")
+        print(f"Memory reserved: {torch.cuda.memory_reserved(0) / 1024**2:.1f} MB")
+    else:
+        print("CUDA available: No")
     
     # Create output directory if not exists
     os.makedirs(config.output_dir, exist_ok=True)
