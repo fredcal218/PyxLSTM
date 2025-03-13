@@ -39,6 +39,7 @@ class xLSTMBlock(nn.Module):
         self.dropout = dropout
         self.lstm_type = lstm_type
 
+        print(f"    Initializing {lstm_type.upper()} with {num_layers} layers")
         if lstm_type == "slstm":
             self.lstm = sLSTM(input_size, hidden_size, num_layers, dropout)
         elif lstm_type == "mlstm":
@@ -46,10 +47,12 @@ class xLSTMBlock(nn.Module):
         else:
             raise ValueError(f"Invalid LSTM type: {lstm_type}")
 
+        print(f"    Creating normalization, activation and projection layers")
         self.norm = nn.LayerNorm(hidden_size)
         self.activation = nn.GELU()
         self.dropout_layer = nn.Dropout(dropout)
         self.proj = nn.Linear(hidden_size, input_size)
+        print(f"    Block initialization completed")
 
     def forward(self, input_seq, hidden_state=None):
         """

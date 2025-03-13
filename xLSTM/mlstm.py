@@ -35,9 +35,15 @@ class mLSTM(nn.Module):
         self.num_layers = num_layers
         self.dropout = dropout
 
-        self.layers = nn.ModuleList([mLSTMCell(input_size if i == 0 else hidden_size, hidden_size) 
-                                     for i in range(num_layers)])
+        print(f"      Creating mLSTM with {num_layers} layers")
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            layer_input = input_size if i == 0 else hidden_size
+            print(f"        Layer {i+1}: input={layer_input}, hidden={hidden_size}")
+            self.layers.append(mLSTMCell(layer_input, hidden_size))
+        
         self.dropout_layer = nn.Dropout(dropout)
+        print(f"      mLSTM initialization completed")
 
     def forward(self, input_seq, hidden_state=None):
         """
