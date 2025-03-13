@@ -13,6 +13,52 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import RobustScaler  # Changed from StandardScaler
 import pickle
+from depression_prediction.sequence_utils import create_overlapping_windows
+
+
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle sequences of varying lengths.
+    
+    This collate function pads sequences to the max length in the batch,
+    which is more efficient than padding all sequences to the global max length.
+    
+    Args:
+        batch (list): List of tuples (features, label)
+        
+    Returns:
+        tuple: Batched features and labels
+    """
+    # Find max sequence length in this batch
+    max_len = max([item[0].size(0) for item in batch])
+    
+    # Get feature dimension
+    feature_dim = batch[0][0].size(1)
+    
+    # Pad sequences to max length in batch
+    features = []
+    labels = []
+    
+    for feature, label in batch:
+        # Current sequence length
+        seq_len = feature.size(0)
+        
+        if seq_len < max_len:
+            # Create padding
+            padding = torch.zeros(max_len - seq_len, feature_dim, dtype=feature.dtype)
+            # Concatenate padding
+            padded_feature = torch.cat([feature, padding], dim=0)
+            features.append(padded_feature)
+        else:
+            features.append(feature)
+            
+        labels.append(label)
+    
+    # Stack into batch tensors
+    features = torch.stack(features)
+    labels = torch.stack(labels)
+    
+    return features, labels
 
 
 class DepressionDataset(Dataset):
@@ -110,33 +156,45 @@ class DepressionDataset(Dataset):
         valid_cols = [col for col in feature_cols if col in df.columns]
         features = df[valid_cols].values
         
-        # Handle NaN values robustly - replace with median of column rather than zero
+        # Time-based frequency analysis for noise reduction
+        # Use rolling windows to smooth out high-frequency noise
+        if features.shape[0] > 10:  # Only if we have enough frames
+            df_features = pd.DataFrame(features)
+            # Apply rolling median with a small window
+            df_features = df_features.rolling(window=5, min_periods=1, center=True).median()
+            features = df_features.values
+        
+        # Handle NaNs with forward-fill then backward-fill
         if features.shape[0] > 0:
-            for col_idx in range(features.shape[1]):
-                col_data = features[:, col_idx]
-                nan_mask = np.isnan(col_data)
-                if np.any(nan_mask):
-                    # If column has NaNs, replace with median of non-NaN values
-                    median_val = np.nanmedian(col_data)
-                    features[nan_mask, col_idx] = median_val
+            df_features = pd.DataFrame(features)
+            df_features = df_features.fillna(method='ffill').fillna(method='bfill')
+            # Any remaining NaNs, fill with column median
+            for col_idx in range(df_features.shape[1]):
+                col_data = df_features.iloc[:, col_idx]
+                if col_data.isna().any():
+                    median_val = col_data.median()
+                    if pd.isna(median_val):
+                        median_val = 0
+                    df_features.iloc[:, col_idx] = col_data.fillna(median_val)
+            
+            features = df_features.values
         
-        # Clip extreme values to prevent NaN during training
-        percentile_99 = np.percentile(features, 99, axis=0)
-        percentile_01 = np.percentile(features, 1, axis=0)
-        # Clip values outside the 1st and 99th percentiles to prevent extreme values
-        features = np.clip(features, percentile_01, percentile_99)
+        # Handle outliers with quantile-based clipping
+        percentile_95 = np.percentile(features, 95, axis=0)
+        percentile_05 = np.percentile(features, 5, axis=0)
+        features = np.clip(features, percentile_05, percentile_95)
         
-        # Initialize and fit scaler if needed
+        # Feature normalization
         if self.scaler is None and self.split == 'train':
-            self.scaler = RobustScaler(quantile_range=(5.0, 95.0))
+            self.scaler = RobustScaler(quantile_range=(25.0, 75.0))  # Standard IQR
             self.scaler.fit(features)
         
         # Apply scaling if scaler is available
         if self.scaler is not None:
             features = self.scaler.transform(features)
-            
-            # Replace any remaining NaNs or infinity values
-            features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Final safety check
+        features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # Cache the processed features
         if self.cache_features and participant_id:
@@ -189,18 +247,35 @@ class DepressionDataset(Dataset):
         # Extract sequence
         sequence = features[start_idx:end_idx]
         
-        # Pad if necessary
+        # For long sequences, use dynamic downsampling to reduce memory usage
+        if len(sequence) > self.max_seq_length:
+            # Downsample by taking every nth frame
+            n = len(sequence) // self.max_seq_length + 1
+            sequence = sequence[::n][:self.max_seq_length]
+        
+        # Always ensure sequence length is exactly max_seq_length
         if len(sequence) < self.max_seq_length:
-            padding = np.zeros((self.max_seq_length - len(sequence), sequence.shape[1]))
-            sequence = np.vstack([sequence, padding])
+            # Use reflection padding for better continuity if we have enough data
+            if len(sequence) > 10:
+                pad_size = self.max_seq_length - len(sequence)
+                reflection_padding = []
+                
+                for i in range(min(pad_size, len(sequence))):
+                    reflection_padding.append(sequence[len(sequence)-1-i % len(sequence)])
+                    
+                padding = np.array(reflection_padding[:pad_size])
+                sequence = np.vstack([sequence, padding])
+            else:
+                # Use zero padding for very short sequences
+                padding = np.zeros((self.max_seq_length - len(sequence), sequence.shape[1]))
+                sequence = np.vstack([sequence, padding])
         
         # Convert to tensor and ensure it's a valid float32
         sequence_tensor = torch.FloatTensor(sequence).contiguous()
         label_tensor = torch.FloatTensor([entry['phq8_score']])
         
-        # Final check for NaNs or infinities that might have slipped through
+        # Final check for NaNs or infinities
         if torch.isnan(sequence_tensor).any() or torch.isinf(sequence_tensor).any():
-            print(f"Warning: NaN/Inf detected in sequence for participant {participant_id}")
             sequence_tensor = torch.nan_to_num(sequence_tensor)
         
         return sequence_tensor, label_tensor
@@ -239,13 +314,14 @@ def get_data_loaders(data_dir, batch_size=16, max_seq_length=1000, stride=500, n
     dev_dataset.scaler = train_dataset.scaler
     test_dataset.scaler = train_dataset.scaler
     
-    # Use multiple workers for faster data loading
+    # Use multiple workers for faster data loading - with custom collate function
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=num_workers,
         pin_memory=True,  # Faster data transfer to GPU
+        collate_fn=custom_collate_fn  # Add custom collate function
     )
     
     dev_loader = DataLoader(
@@ -254,6 +330,7 @@ def get_data_loaders(data_dir, batch_size=16, max_seq_length=1000, stride=500, n
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=custom_collate_fn  # Add custom collate function
     )
     
     test_loader = DataLoader(
@@ -262,6 +339,7 @@ def get_data_loaders(data_dir, batch_size=16, max_seq_length=1000, stride=500, n
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=custom_collate_fn  # Add custom collate function
     )
     
     return train_loader, dev_loader, test_loader

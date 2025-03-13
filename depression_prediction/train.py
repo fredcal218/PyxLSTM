@@ -19,6 +19,7 @@ from tqdm import tqdm
 from depression_prediction.data_loader import get_data_loaders
 from depression_prediction.models import create_model
 from depression_prediction.utils import set_seed, get_feature_dimension
+from depression_prediction.sequence_utils import process_long_sequence
 
 # Import for mixed precision training
 try:
@@ -136,15 +137,21 @@ def evaluate(model, data_loader, criterion, device):
             if features.size(0) == 0:
                 continue
                 
-            features = features.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             
-            # Safety check for NaN inputs
-            if torch.isnan(features).any() or torch.isinf(features).any():
-                features = torch.nan_to_num(features)
+            # Check if sequence is too long for direct processing
+            if features.size(1) * features.size(2) > 100000000:  # Threshold for "very long" sequences
+                # Process in chunks
+                outputs, _ = process_long_sequence(model, features, max_chunk_length=5000, 
+                                                  overlap=1000, device=device)
+            else:
+                # Standard processing
+                features = features.to(device, non_blocking=True)
+                # Safety check for NaN inputs
+                if torch.isnan(features).any() or torch.isinf(features).any():
+                    features = torch.nan_to_num(features)
+                outputs, _ = model(features)
             
-            # Forward pass
-            outputs, _ = model(features)
             loss = criterion(outputs, labels)
             
             # Check for NaN loss
@@ -178,6 +185,47 @@ def evaluate(model, data_loader, criterion, device):
         mae, rmse, r2 = float('nan'), float('nan'), float('nan')
     
     return total_loss / batch_count, mae, rmse, r2
+
+
+def predict_with_best_model(model, data_loader, device, model_path):
+    """
+    Make predictions using the best saved model.
+    
+    Args:
+        model: Model to use for predictions
+        data_loader: Data loader containing test data
+        device: Device to run predictions on
+        model_path: Path to the best model weights
+        
+    Returns:
+        tuple: Predictions and true labels
+    """
+    model.load_state_dict(torch.load(model_path, weights_only=True))
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    progress_bar = tqdm(data_loader, desc="Predicting", leave=False)
+    
+    with torch.no_grad():
+        for features, labels in progress_bar:
+            if features.size(0) == 0:
+                continue
+                
+            # Handle very long sequences using chunking
+            if features.size(1) * features.size(2) > 100000000:
+                outputs, _ = process_long_sequence(model, features, max_chunk_length=5000, 
+                                                  overlap=1000, device=device)
+            else:
+                features = features.to(device, non_blocking=True)
+                if torch.isnan(features).any() or torch.isinf(features).any():
+                    features = torch.nan_to_num(features)
+                outputs, _ = model(features)
+            
+            all_preds.extend(torch.nan_to_num(outputs).cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    return all_preds, all_labels
 
 
 def train(args):
@@ -239,15 +287,22 @@ def train(args):
     
     # Set up loss function and optimizer
     print("\n=== Setting up training components ===")
-    criterion = nn.MSELoss()
-    print(f"Loss function: MSE")
+    criterion = nn.SmoothL1Loss()  # Huber loss with better stability properties
+    print(f"Loss function: SmoothL1Loss (Huber loss)")
     
-    # Use AdamW instead of Adam (better weight decay handling)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
-    print(f"Optimizer: AdamW with learning rate {args.learning_rate} and weight decay 1e-5")
+    # Optimizer with weight decay for better regularization
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.005)
+    print(f"Optimizer: AdamW with learning rate {args.learning_rate} and weight decay 0.005")
     
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-    print("Scheduler: ReduceLROnPlateau with factor 0.5 and patience 2")
+    # Learning rate scheduler with warmup
+    def lr_lambda(current_step):
+        warmup_steps = 5
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        return 1.0
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    print("Scheduler: LambdaLR with warmup")
     
     # Set up gradient clipping
     gradient_clip = getattr(args, 'gradient_clip', None)
@@ -412,33 +467,24 @@ def train(args):
         torch.save(model.state_dict(), os.path.join(args.output_dir, "final_model.pt"))
         best_model_path = os.path.join(args.output_dir, "final_model.pt")
     
-    # Evaluate on test set using best model if available
-    try:
-        model.load_state_dict(torch.load(best_model_path, weights_only=True))
-        test_loss, test_mae, test_rmse, test_r2 = evaluate(model, test_loader, criterion, device)
-        
-        print("\nTest Results:")
-        print(f"  Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}")
-        
-        # Save final metrics
-        metrics = {
-            "test_loss": test_loss,
-            "test_mae": test_mae,
-            "test_rmse": test_rmse,
-            "test_r2": test_r2
-        }
-        
-        writer.add_hparams(
-            {"hidden_size": args.hidden_size,
-             "num_layers": args.num_layers,
-             "num_blocks": args.num_blocks,
-             "lstm_type": args.lstm_type,
-             "dropout": args.dropout,
-             "lr": args.learning_rate},
-            metrics
-        )
-    except Exception as e:
-        print(f"\nFailed to evaluate on test set: {e}")
+    # Final evaluation section
+    print("\n=== Evaluating best model on test set ===")
+    if not os.path.exists(best_model_path):
+        print("No best model found. Using final model.")
+        best_model_path = os.path.join(args.output_dir, "final_model.pt")
+        torch.save(model.state_dict(), best_model_path)
+    
+    # Make predictions with the best model
+    test_preds, test_labels = predict_with_best_model(model, test_loader, device, best_model_path)
+    
+    # Calculate metrics
+    test_loss = criterion(torch.tensor(test_preds), torch.tensor(test_labels)).item()
+    test_mae = mean_absolute_error(test_labels, test_preds)
+    test_rmse = np.sqrt(mean_squared_error(test_labels, test_preds))
+    test_r2 = r2_score(test_labels, test_preds)
+    
+    print("\nTest Results:")
+    print(f"  Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}")
     
     writer.close()
     print("\nTraining completed!")

@@ -177,3 +177,5 @@ tests/
 E-DAIC/
 output/
 depression_prediction/*.md
+.github/*.md
+memory_xlstm.md

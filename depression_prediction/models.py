@@ -8,6 +8,7 @@ depression severity using the PHQ-8 scale.
 import torch
 import torch.nn as nn
 from xLSTM import xLSTMBlock
+from depression_prediction.sequence_utils import apply_exponential_attention
 
 
 class DepressionPredictor(nn.Module):
@@ -31,12 +32,12 @@ class DepressionPredictor(nn.Module):
         self.num_layers = num_layers
         self.num_blocks = num_blocks
         
+        # Feature projection layer optimized for xLSTM
         print(f"  Creating feature projection layer: {input_size} -> {hidden_size}")
-        # Feature projection layer with gradient stabilization
         self.feature_proj = nn.Sequential(
             nn.Linear(input_size, hidden_size),
-            nn.LayerNorm(hidden_size),  # Add layer normalization for stability
-            nn.ReLU()
+            nn.LayerNorm(hidden_size),
+            nn.GELU()  # Match GELU activation used in xLSTM blocks
         )
         
         # xLSTM blocks
@@ -50,28 +51,25 @@ class DepressionPredictor(nn.Module):
                 xLSTMBlock(hidden_size, hidden_size, num_layers, dropout, lstm_type)
             )
             self.lstm_block_count += 1
-            
-            # Add stabilizing layers after each block
-            if i < num_blocks - 1:  # Don't add after the last block
-                self.blocks.append(nn.LayerNorm(hidden_size))
         
-        print("  Creating attention layer for sequence aggregation")
-        # Attention layer for sequence aggregation with stability improvements
+        # Create temporal attention for sequence aggregation
+        print("  Creating temporal attention mechanism")
         self.attention = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.Tanh(),  # More stable than ReLU for attention
-            nn.Linear(64, 1),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1),
             nn.Softmax(dim=1)
         )
         
+        # Regression head for PHQ-8 prediction
         print("  Creating PHQ-8 regression head")
-        # Regression head for PHQ-8 prediction with gradient stabilization
         self.regressor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.LayerNorm(hidden_size // 2),  # Add layer normalization
-            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1)
+            nn.Linear(hidden_size, 1)
         )
         print("  Model architecture completed")
 
@@ -88,46 +86,38 @@ class DepressionPredictor(nn.Module):
         """
         batch_size, seq_length, _ = x.size()
         
-        # Project input features with stabilized gradient flow
+        # Apply exponential attention to emphasize more recent frames
+        x = apply_exponential_attention(x)
+        
+        # Project input features
         x = self.feature_proj(x)
         
-        # Initialize hidden states if not provided - fixing the error
+        # Initialize hidden states if not provided
         if hidden_states is None:
             hidden_states = [None] * self.lstm_block_count
         
         # Process through xLSTM blocks
         block_idx = 0
-        for i in range(len(self.blocks)):
-            module = self.blocks[i]
-            if isinstance(module, xLSTMBlock):
-                x, hidden_states[block_idx] = module(x, hidden_states[block_idx])
-                block_idx += 1
-            else:
-                # It's a normalization layer
-                x = module(x)
+        for i, module in enumerate(self.blocks):
+            x, hidden_states[block_idx] = module(x, hidden_states[block_idx])
+            block_idx += 1
         
         # Apply attention to aggregate sequence information
         attention_weights = self.attention(x)
-        
-        # Apply attention with numerical stability check
         weighted_x = x * attention_weights
         
-        # Check for NaN/Inf values
+        # Handle potential NaN values safely
         if torch.isnan(weighted_x).any() or torch.isinf(weighted_x).any():
-            # If found, replace with zeros
-            print("Warning: NaN/Inf detected in attention output, replacing with zeros")
             weighted_x = torch.nan_to_num(weighted_x, nan=0.0, posinf=0.0, neginf=0.0)
         
+        # Sum along sequence dimension to get context vector
         context_vector = torch.sum(weighted_x, dim=1)
         
         # Predict PHQ-8 score with numerical stability
         phq8_score = self.regressor(context_vector)
         
-        # Final safety check for NaN/Inf values
-        if torch.isnan(phq8_score).any() or torch.isinf(phq8_score).any():
-            # If found, replace with zeros
-            print("Warning: NaN/Inf detected in model output, replacing with zeros")
-            phq8_score = torch.zeros_like(phq8_score)
+        # Clamp to valid PHQ-8 range (0-24)
+        phq8_score = torch.clamp(phq8_score, min=0.0, max=24.0)
         
         return phq8_score, hidden_states
 
