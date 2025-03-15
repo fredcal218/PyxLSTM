@@ -18,7 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from xLSTM.slstm import sLSTM
+from xLSTM_1.slstm import sLSTM
 
 class TestSLSTM(unittest.TestCase):
     def setUp(self):

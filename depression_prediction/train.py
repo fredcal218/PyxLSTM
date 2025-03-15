@@ -15,11 +15,13 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from depression_prediction.data_loader import get_data_loaders
 from depression_prediction.models import create_model
 from depression_prediction.utils import set_seed, get_feature_dimension
 from depression_prediction.sequence_utils import process_long_sequence
+from depression_prediction.utils import plot_evaluation_results
 
 # Import for mixed precision training
 try:
@@ -331,6 +333,42 @@ def train(args):
     best_model_path = os.path.join(args.output_dir, "best_model.pt")
     consecutive_nan_epochs = 0
     
+    # Variables to track training progress
+    start_epoch = 0
+    
+    # Resume training from checkpoint if specified
+    if hasattr(args, 'resume_from_checkpoint') and args.resume_from_checkpoint:
+        if hasattr(args, 'checkpoint_path') and os.path.isfile(args.checkpoint_path):
+            print(f"\n=== Resuming from checkpoint: {args.checkpoint_path} ===")
+            checkpoint = torch.load(args.checkpoint_path, map_location=device)
+            
+            # Load model weights
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Load optimizer state
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Load scheduler state if it exists
+            if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            # Update start epoch
+            start_epoch = checkpoint['epoch'] + 1
+            
+            # Update best metrics if available
+            if 'dev_loss' in checkpoint:
+                best_dev_loss = checkpoint['dev_loss']
+            
+            if 'dev_mae' in checkpoint:
+                best_dev_mae = checkpoint['dev_mae']
+                
+            print(f"Resuming training from epoch {start_epoch}")
+            print(f"Previous best dev loss: {best_dev_loss:.4f}")
+            print(f"Previous best dev MAE: {best_dev_mae:.4f}")
+        else:
+            print(f"Warning: Checkpoint file not found at {getattr(args, 'checkpoint_path', 'unknown path')}")
+            print("Starting training from scratch.")
+    
     # Early stopping setup
     early_stopping = getattr(args, 'early_stopping', False)
     early_stopping_patience = getattr(args, 'early_stopping_patience', 5)
@@ -344,7 +382,7 @@ def train(args):
         print(f"  Early Stopping Metric: {early_stopping_metric}")
     
     # Create progress bar for epochs
-    epochs_progress = tqdm(range(args.num_epochs), desc="Training epochs", unit="epoch")
+    epochs_progress = tqdm(range(start_epoch, args.num_epochs), desc="Training epochs", unit="epoch")
     
     for epoch in epochs_progress:
         start_time = time.time()
@@ -477,17 +515,33 @@ def train(args):
     # Make predictions with the best model
     test_preds, test_labels = predict_with_best_model(model, test_loader, device, best_model_path)
     
-    # Calculate metrics
+    # Calculate metrics and generate evaluation plots
+    test_metrics = plot_evaluation_results(
+        test_labels, test_preds, args.output_dir, prefix="test_"
+    )
+    
+    # Calculate loss separately since it's not part of the plotting function
     test_loss = criterion(torch.tensor(test_preds), torch.tensor(test_labels)).item()
-    test_mae = mean_absolute_error(test_labels, test_preds)
-    test_rmse = np.sqrt(mean_squared_error(test_labels, test_preds))
-    test_r2 = r2_score(test_labels, test_preds)
     
     print("\nTest Results:")
-    print(f"  Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}")
+    print(f"  Loss: {test_loss:.4f}, MAE: {test_metrics['mae']:.4f}, " + 
+          f"RMSE: {test_metrics['rmse']:.4f}, R²: {test_metrics['r2']:.4f}")
+    
+    # Also evaluate best MAE model if it's different from the best loss model
+    mae_model_path = os.path.join(args.output_dir, "best_mae_model.pt")
+    if os.path.exists(mae_model_path) and mae_model_path != best_model_path:
+        print("\n=== Evaluating best MAE model on test set ===")
+        mae_preds, mae_labels = predict_with_best_model(model, test_loader, device, mae_model_path)
+        
+        mae_metrics = plot_evaluation_results(
+            mae_labels, mae_preds, args.output_dir, prefix="mae_model_"
+        )
+        
+        print("\nBest MAE Model Test Results:")
+        print(f"  MAE: {mae_metrics['mae']:.4f}, RMSE: {mae_metrics['rmse']:.4f}, R²: {mae_metrics['r2']:.4f}")
     
     writer.close()
-    print("\nTraining completed!")
+    print("\nTraining and evaluation completed!")
 
 
 if __name__ == "__main__":
@@ -534,6 +588,10 @@ if __name__ == "__main__":
                         help="Patience for early stopping")
     parser.add_argument("--early_stopping_metric", type=str, default="mae", choices=["loss", "mae", "rmse", "r2"],
                         help="Metric for early stopping")
+    parser.add_argument("--resume_from_checkpoint", action="store_true",
+                        help="Resume training from a checkpoint")
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                        help="Path to the checkpoint file to resume from")
     
     args = parser.parse_args()
     train(args)

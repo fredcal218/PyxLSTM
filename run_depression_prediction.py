@@ -20,8 +20,8 @@ def main():
             # Data parameters - Optimized for xLSTM's strengths
             self.data_dir = "E-DAIC"
             self.output_dir = "./output"
-            self.max_seq_length = 20000  # Increased to leverage xLSTM's long sequence capabilities
-            self.stride = 10000          # Larger stride for efficiency
+            self.max_seq_length = 9000 
+            self.stride = 4500          
             
             # Model Parameters - Optimized for xLSTM architecture
             self.hidden_size = 96        # Sized for representational capacity
@@ -39,7 +39,7 @@ def main():
             
             # Stability optimization
             self.gradient_clip = 0.5     # Conservative clipping to prevent exploding gradients
-            self.checkpoint_interval = 5
+            self.checkpoint_interval = 1
             self.mixed_precision = True
             
             # Early stopping parameters
@@ -49,11 +49,16 @@ def main():
             
             # Performance optimization
             self.num_workers = min(os.cpu_count(), 2)  # Lower worker count for memory efficiency
-            
+            6
             # Sequence processing parameters
             self.chunk_long_sequences = True     # Enable processing very long sequences in chunks
             self.max_chunk_length = 5000         # Maximum chunk length for processing
+            
             self.chunk_overlap = 1000            # Overlap between chunks
+            
+            # Resume training from checkpoint
+            self.resume_from_checkpoint = False
+            self.checkpoint_path = "./output/checkpoints/checkpoint_epoch_1.pt"
     
     # Create configuration
     config = Config()

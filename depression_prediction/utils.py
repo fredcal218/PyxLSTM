@@ -194,3 +194,101 @@ def print_memory_stats():
     
     print(f"Total tensors: {total_tensors}")
     print(f"Total tensor memory: {total_size / 1024**2:.2f} MB")
+
+
+def plot_metrics(metrics_dict, output_path):
+    """
+    Plot metrics as a bar chart.
+    
+    Args:
+        metrics_dict (dict): Dictionary of metrics to plot (name -> value).
+        output_path (str): Path to save the plot.
+    """
+    plt.figure(figsize=(10, 6))
+    metrics = list(metrics_dict.keys())
+    values = list(metrics_dict.values())
+    
+    # Custom colors for different metrics
+    colors = ['#4CAF50', '#FF5722', '#2196F3', '#FFC107'][:len(metrics)]
+    
+    plt.bar(metrics, values, color=colors)
+    plt.title(f'Depression Prediction Metrics\n' + 
+              '\n'.join([f"{m}: {v:.4f}" for m, v in metrics_dict.items()]))
+    plt.ylabel('Value')
+    plt.grid(axis='y', alpha=0.3)
+    
+    # Add values on top of bars
+    for i, val in enumerate(values):
+        plt.text(i, val + max(values) * 0.01, f"{val:.4f}", ha='center', fontweight='bold')
+        
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    
+    print(f"Metrics plot saved to {output_path}")
+
+
+def plot_evaluation_results(true_values, predictions, output_dir, prefix=""):
+    """
+    Create and save comprehensive evaluation plots.
+    
+    Args:
+        true_values (list): True PHQ-8 scores.
+        predictions (list): Predicted PHQ-8 scores.
+        output_dir (str): Directory to save plots.
+        prefix (str, optional): Prefix for plot filenames.
+    
+    Returns:
+        dict: Dictionary of calculated metrics.
+    """
+    # Clean data and calculate metrics
+    valid_indices = []
+    for i in range(len(true_values)):
+        if (not np.isnan(true_values[i]) and not np.isnan(predictions[i]) and 
+            not np.isinf(true_values[i]) and not np.isinf(predictions[i])):
+            valid_indices.append(i)
+    
+    if not valid_indices:
+        print("Warning: No valid prediction pairs to plot")
+        return {
+            "mae": float('nan'),
+            "rmse": float('nan'),
+            "r2": float('nan')
+        }
+        
+    clean_true = np.array([true_values[i] for i in valid_indices])
+    clean_pred = np.array([predictions[i] for i in valid_indices])
+    
+    # Calculate metrics
+    mae = mean_absolute_error(clean_true, clean_pred)
+    rmse = np.sqrt(mean_squared_error(clean_true, clean_pred))
+    r2 = r2_score(clean_true, clean_pred)
+    
+    metrics = {
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2
+    }
+    
+    # 1. Plot true vs predicted values
+    plot_predictions(clean_true, clean_pred, 
+                    os.path.join(output_dir, f"{prefix}predictions.png"))
+    
+    # 2. Plot metrics
+    plot_metrics({"MAE": mae, "RMSE": rmse}, 
+                os.path.join(output_dir, f"{prefix}metrics.png"))
+    
+    # 3. Plot error distribution
+    errors = clean_pred - clean_true
+    plt.figure(figsize=(10, 6))
+    plt.hist(errors, bins=20, alpha=0.7, color='#2196F3')
+    plt.axvline(x=0, color='r', linestyle='--')
+    plt.title(f'Prediction Error Distribution\nMean Error: {np.mean(errors):.4f}, Std Dev: {np.std(errors):.4f}')
+    plt.xlabel('Prediction Error (Predicted - True)')
+    plt.ylabel('Frequency')
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(output_dir, f"{prefix}error_distribution.png"))
+    plt.close()
+    
+    print(f"Evaluation plots saved to {output_dir}")
+    return metrics

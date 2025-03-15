@@ -7,7 +7,7 @@ depression severity using the PHQ-8 scale.
 
 import torch
 import torch.nn as nn
-from xLSTM import xLSTMBlock
+from xLSTM_1 import xLSTMBlock
 from depression_prediction.sequence_utils import apply_exponential_attention
 
 

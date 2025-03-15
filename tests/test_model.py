@@ -18,7 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from xLSTM.model import xLSTM
+from xLSTM_1.model import xLSTM
 
 class TestXLSTMModel(unittest.TestCase):
     def setUp(self):

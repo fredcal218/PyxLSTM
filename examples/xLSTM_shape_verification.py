@@ -1,9 +1,9 @@
 import torch
 
-from xLSTM import xLSTMBlock
-from xLSTM import sLSTM
-from xLSTM import mLSTM
-from xLSTM import xLSTM
+from xLSTM_1 import xLSTMBlock
+from xLSTM_1 import sLSTM
+from xLSTM_1 import mLSTM
+from xLSTM_1 import xLSTM
 
 # Define the model hyperparameters
 vocab_size = 10000
