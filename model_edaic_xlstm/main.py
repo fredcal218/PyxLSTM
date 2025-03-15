@@ -3,6 +3,8 @@ import torch
 import numpy as np
 import random
 import torch.nn as nn
+import json
+from datetime import datetime
 
 from model import EDAIC_LSTM
 from dataset import EDAICDataset
@@ -34,6 +36,46 @@ def main():
     
     # Ensure checkpoints directory exists
     os.makedirs(save_dir, exist_ok=True)
+    
+    # Save hyperparameters to JSON file
+    hyperparams = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model": "EDAIC_LSTM with xLSTM",
+        "dataset": "E-DAIC",
+        "training": {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "patience": patience,
+            "seed": seed,
+            "optimizer": "Adam",
+            "loss_function": "MSE",
+            "scheduler": "ReduceLROnPlateau (factor=0.5, patience=15, min_lr=1e-6)"
+        },
+        "model_architecture": {
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout
+        },
+        "data_processing": {
+            "seq_length": seq_length,
+            "stride": stride,
+            "features": "pose, gaze, AU intensities (AU confidences excluded)"
+        },
+        "hardware": {
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+        }
+    }
+    
+    # Save hyperparameters to JSON file
+    hyperparams_path = os.path.join(save_dir, 'hyperparameters.json')
+    with open(hyperparams_path, 'w') as f:
+        json.dump(hyperparams, f, indent=2)
+    
+    print(f"Hyperparameters saved to {hyperparams_path}")
     
     # Set random seed
     set_seed(seed)
@@ -103,40 +145,72 @@ def main():
     trainer.load_best_model()
     
     print("\nEvaluating best model on test set:")
-    # Get final metrics on the test set with the best model
+    # Create DataLoader for test set evaluation
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size)
     test_metrics = validate_epoch(model, test_loader, criterion, device)
-    test_loss, test_acc, test_rmse, test_mae, test_r2 = test_metrics
+    test_loss, test_binary_acc, test_overall_acc, (test_level_acc, test_level_accs), test_rmse, test_mae, test_r2 = test_metrics
+    
+    # Level names for clearer display
+    level_names = ['None/Minimal', 'Mild', 'Moderate', 'Mod. Severe', 'Severe']
     
     print(f"Test set evaluation:")
-    print(f"  Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, RMSE: {test_rmse:.4f}, MAE: {test_mae:.4f}, R²: {test_r2:.4f}")
+    print(f"  Loss: {test_loss:.4f}")
+    print(f"  Binary Accuracy: {test_binary_acc:.4f} (depression threshold: 10)")
+    print(f"  Overall Accuracy: {test_overall_acc:.4f} (tolerance: ±1)")
+    print(f"  PHQ Level Accuracy: {test_level_acc:.4f}")
+    print("  Per-level Accuracies:")
+    for i, (name, acc) in enumerate(zip(level_names, test_level_accs)):
+        print(f"    - {name}: {acc:.4f}")
+    print(f"  RMSE: {test_rmse:.4f}, MAE: {test_mae:.4f}, R²: {test_r2:.4f}")
     
     # For comparison, also evaluate on validation set
+    # Create a DataLoader for validation set instead of using dataset directly
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size)
     print("\nValidation set results for comparison:")
-    val_metrics = validate_epoch(model, val_dataset, criterion, device)
-    val_loss, val_acc, val_rmse, val_mae, val_r2 = val_metrics
-    print(f"  Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, RMSE: {val_rmse:.4f}, MAE: {val_mae:.4f}, R²: {val_r2:.4f}")
+    val_metrics = validate_epoch(model, val_loader, criterion, device)
+    val_loss, val_binary_acc, val_overall_acc, (val_level_acc, val_level_accs), val_rmse, val_mae, val_r2 = val_metrics
     
-    # Save final results
+    print(f"  Loss: {val_loss:.4f}")
+    print(f"  Binary Accuracy: {val_binary_acc:.4f} (depression threshold: 10)")
+    print(f"  Overall Accuracy: {val_overall_acc:.4f} (tolerance: ±1)")
+    print(f"  PHQ Level Accuracy: {val_level_acc:.4f}")
+    print("  Per-level Accuracies:")
+    for i, (name, acc) in enumerate(zip(level_names, val_level_accs)):
+        print(f"    - {name}: {acc:.4f}")
+    print(f"  RMSE: {val_rmse:.4f}, MAE: {val_mae:.4f}, R²: {val_r2:.4f}")
+    
+    # Save final results with all metrics
     results = {
         "test_metrics": {
             "loss": float(test_loss),
-            "accuracy": float(test_acc),
+            "binary_accuracy": float(test_binary_acc),
+            "overall_accuracy": float(test_overall_acc),
+            "level_accuracy": float(test_level_acc),
+            "level_accuracies": {
+                level_names[i]: float(acc) for i, acc in enumerate(test_level_accs)
+            },
             "rmse": float(test_rmse),
             "mae": float(test_mae),
             "r2": float(test_r2)
         },
         "val_metrics": {
             "loss": float(val_loss),
-            "accuracy": float(val_acc),
+            "binary_accuracy": float(val_binary_acc),
+            "overall_accuracy": float(val_overall_acc),
+            "level_accuracy": float(val_level_acc),
+            "level_accuracies": {
+                level_names[i]: float(acc) for i, acc in enumerate(val_level_accs)
+            },
             "rmse": float(val_rmse),
             "mae": float(val_mae),
             "r2": float(val_r2)
         }
     }
     
+    # Add hyperparameters to the results
+    results["hyperparameters"] = hyperparams
+    
     # Save evaluation results
-    import json
     with open(os.path.join(save_dir, 'evaluation_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
     

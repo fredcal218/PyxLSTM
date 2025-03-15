@@ -122,3 +122,82 @@ class EDAIC_LSTM(nn.Module):
         total = binary_targets.numel()
         
         return correct / total
+    
+    def calculate_overall_accuracy(self, predictions, targets, tolerance=1.0):
+        """
+        Calculate overall accuracy for depression scores with tolerance.
+        
+        Args:
+            predictions (torch.Tensor): Model's predicted depression scores
+            targets (torch.Tensor): Ground truth depression scores
+            tolerance (float): Tolerance for considering a prediction correct
+                              (prediction is correct if |pred - target| <= tolerance)
+            
+        Returns:
+            float: Overall accuracy score
+        """
+        # Consider prediction correct if within tolerance range of target
+        correct_predictions = (torch.abs(predictions - targets) <= tolerance).float().sum()
+        total = targets.numel()
+        
+        return correct_predictions / total
+    
+    def calculate_per_level_accuracy(self, predictions, targets):
+        """
+        Calculate accuracy for each PHQ-8 depression severity level.
+        
+        PHQ-8 Score ranges:
+        0-4: None or minimal (level 0)
+        5-9: Mild (level 1)
+        10-14: Moderate (level 2)
+        15-19: Moderately severe (level 3)
+        20-24: Severe (level 4)
+        
+        Args:
+            predictions (torch.Tensor): Model's predicted depression scores
+            targets (torch.Tensor): Ground truth depression scores
+            
+        Returns:
+            tuple: (overall_accuracy, level_accuracies)
+                - overall_accuracy: float, accuracy across all categories
+                - level_accuracies: list of floats, accuracy for each severity level
+        """
+        # Define PHQ level thresholds and names
+        level_thresholds = torch.tensor([0, 5, 10, 15, 20, 25], device=predictions.device)
+        level_names = ['None/Minimal', 'Mild', 'Moderate', 'Mod. Severe', 'Severe']
+        
+        # Convert predictions to levels
+        pred_levels = torch.zeros_like(predictions, dtype=torch.long)
+        target_levels = torch.zeros_like(targets, dtype=torch.long)
+        
+        # Assign levels based on thresholds
+        for i in range(len(level_thresholds)-1):
+            pred_levels[(predictions >= level_thresholds[i]) & (predictions < level_thresholds[i+1])] = i
+            target_levels[(targets >= level_thresholds[i]) & (targets < level_thresholds[i+1])] = i
+        
+        # Handle edge case for maximum score
+        pred_levels[predictions >= level_thresholds[-1]] = len(level_thresholds) - 2
+        target_levels[targets >= level_thresholds[-1]] = len(level_thresholds) - 2
+        
+        # Calculate overall accuracy
+        correct = (pred_levels == target_levels).float().sum()
+        total = target_levels.numel()
+        overall_accuracy = (correct / total).item() if total > 0 else 0.0
+        
+        # Calculate accuracy for each level
+        level_accuracies = []
+        for i in range(len(level_names)):
+            # Get samples where the true level is i
+            level_mask = (target_levels == i)
+            level_count = level_mask.sum().item()
+            
+            if level_count > 0:
+                # Calculate accuracy for this level
+                level_correct = ((pred_levels == i) & level_mask).float().sum()
+                level_accuracy = (level_correct / level_count).item()
+            else:
+                level_accuracy = 0.0  # No samples for this level
+                
+            level_accuracies.append(level_accuracy)
+        
+        return overall_accuracy, level_accuracies

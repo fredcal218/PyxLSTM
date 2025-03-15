@@ -179,3 +179,7 @@ output/
 depression_prediction/*.md
 .github/*.md
 memory_xlstm.md
+model_edaic_xlstm/analysis/
+
+*.json
+*.png
