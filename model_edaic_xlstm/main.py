@@ -8,7 +8,7 @@ from datetime import datetime
 
 from model import EDAIC_LSTM
 from dataset import EDAICDataset
-from trainer import Trainer, validate_epoch, WeightedMAELoss  # Import WeightedMAELoss from trainer
+from trainer import Trainer, validate_epoch, CombinedLoss 
 
 def set_seed(seed):
     """Set seeds for reproducibility"""
@@ -21,18 +21,18 @@ def set_seed(seed):
 
 def main():
     # Hard-coded parameters
-    base_dir = 'E-DAIC'  # Base directory for E-DAIC dataset
-    save_dir = os.path.join('model_edaic_xlstm', 'checkpoints') # Directory to save model checkpoints
+    base_dir = 'E-DAIC'  
+    save_dir = os.path.join('model_edaic_xlstm', 'checkpoints') 
     epochs = 300
-    patience = 50  
+    patience = 30  
     batch_size = 32
-    learning_rate = 0.00001
+    learning_rate = 0.0001
     hidden_size = 256
-    num_layers = 3
+    num_layers = 2
     dropout = 0.3
-    seq_length = 900  # Reduced 10x since we're taking every 10th frame (was 5000)
-    stride = 450      # Reduced 10x for same reason (was 2500)
-    frame_step = 10   # Sample every 10th frame
+    seq_length = 4500  
+    stride = 2250      
+    frame_step = 5   # Sample every nth frame
     seed = 46
     
     # Ensure checkpoints directory exists
@@ -131,13 +131,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    # Use weighted MAE loss instead of standard MAE
-    criterion = WeightedMAELoss(scale_factor=0.2)  # Higher weight for higher PHQ scores
+    # Use combined loss with both weighting and variance regularization
+    # and increased lambda_var for stronger variance regularization
+    criterion = CombinedLoss(
+        scale_factor=0.3,        
+        min_variance=16.0,      
+        lambda_var=0.5           # Increased from 0.1 to 0.5 to more strongly encourage variance
+    )
     
-    # Update hyperparameters to reflect weighted loss
-    hyperparams["training"]["loss_function"] = "Weighted MAE (scale_factor=0.2)"
+    # Update hyperparameters to reflect combined loss
+    hyperparams["training"]["loss_function"] = "Combined Loss (scale_factor=0.3, min_variance=16.0, lambda_var=0.5)"
     
     # Create trainer with our custom loss
+    # Stratified sampling will be automatically applied in the Trainer constructor
     trainer = Trainer(
         model=model,
         train_dataset=train_dataset,
@@ -145,7 +151,7 @@ def main():
         batch_size=batch_size,
         learning_rate=learning_rate,
         save_dir=save_dir,
-        criterion=criterion  # Pass custom loss to trainer
+        criterion=criterion
     )
     
     # Train model with early stopping and LR scheduling
@@ -159,7 +165,8 @@ def main():
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size)
     test_metrics = validate_epoch(model, test_loader, criterion, device)
     test_loss, test_binary_acc, test_overall_acc, (test_level_acc, test_level_accs), \
-        (test_score_tol_acc, test_threshold_accs), test_rmse, test_mae, test_r2 = test_metrics
+        (test_score_tol_acc, test_threshold_accs), test_rmse, test_mae, test_r2, \
+        test_precision, test_recall, test_f1 = test_metrics
     
     # Level names for clearer display
     level_names = ['None/Minimal', 'Mild', 'Moderate', 'Mod. Severe', 'Severe']
@@ -169,6 +176,7 @@ def main():
     print(f"Test set evaluation:")
     print(f"  Loss: {test_loss:.4f}")
     print(f"  Binary Accuracy: {test_binary_acc:.4f} (depression threshold: 10)")
+    print(f"  Precision: {test_precision:.4f}, Recall: {test_recall:.4f}, F1: {test_f1:.4f}")
     print(f"  Overall Accuracy: {test_overall_acc:.4f} (tolerance: ±1)")
     print(f"  Score Tolerance: {test_score_tol_acc:.4f} (tolerance: ±2 points)")
     print("  Threshold Accuracies (±2 points near threshold):")
@@ -185,10 +193,12 @@ def main():
     print("\nValidation set results for comparison:")
     val_metrics = validate_epoch(model, val_loader, criterion, device)
     val_loss, val_binary_acc, val_overall_acc, (val_level_acc, val_level_accs), \
-        (val_score_tol_acc, val_threshold_accs), val_rmse, val_mae, val_r2 = val_metrics
+        (val_score_tol_acc, val_threshold_accs), val_rmse, val_mae, val_r2, \
+        val_precision, val_recall, val_f1 = val_metrics
     
     print(f"  Loss: {val_loss:.4f}")
     print(f"  Binary Accuracy: {val_binary_acc:.4f} (depression threshold: 10)")
+    print(f"  Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, F1: {val_f1:.4f}")
     print(f"  Overall Accuracy: {val_overall_acc:.4f} (tolerance: ±1)")
     print(f"  Score Tolerance: {val_score_tol_acc:.4f} (tolerance: ±2 points)")
     print("  Threshold Accuracies (±2 points near threshold):")
@@ -200,7 +210,7 @@ def main():
         print(f"    - {name}: {acc:.4f}")
     print(f"  RMSE: {val_rmse:.4f}, MAE: {val_mae:.4f}, R²: {val_r2:.4f}")
     
-    # Save final results with all metrics
+    # Save final results with all metrics including classification metrics
     results = {
         "test_metrics": {
             "loss": float(test_loss),
@@ -216,7 +226,10 @@ def main():
             },
             "rmse": float(test_rmse),
             "mae": float(test_mae),
-            "r2": float(test_r2)
+            "r2": float(test_r2),
+            "precision": float(test_precision),
+            "recall": float(test_recall),
+            "f1": float(test_f1)
         },
         "val_metrics": {
             "loss": float(val_loss),
@@ -232,7 +245,10 @@ def main():
             },
             "rmse": float(val_rmse),
             "mae": float(val_mae),
-            "r2": float(val_r2)
+            "r2": float(val_r2),
+            "precision": float(val_precision),
+            "recall": float(val_recall),
+            "f1": float(val_f1)
         }
     }
     

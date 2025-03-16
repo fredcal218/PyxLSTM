@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, precision_recall_fscore_support
 import os
 import time
 import math
@@ -56,6 +56,60 @@ class WeightedMAELoss(nn.Module):
         # Return mean loss
         return weighted_mae.mean()
 
+# Add new CombinedLoss class below WeightedMAELoss
+class CombinedLoss(nn.Module):
+    """
+    Combined loss function that incorporates both weighting for higher PHQ-8 scores
+    and variance regularization to encourage wider prediction ranges.
+    """
+    def __init__(self, scale_factor=0.3, min_variance=16.0, lambda_var=0.5):
+        """
+        Initialize combined loss function.
+        
+        Args:
+            scale_factor (float): Weight scale factor for higher PHQ-8 scores
+            min_variance (float): Minimum desired variance for predictions
+            lambda_var (float): Weight of the variance regularization term
+        """
+        super(CombinedLoss, self).__init__()
+        self.scale_factor = scale_factor
+        self.min_variance = min_variance
+        self.lambda_var = lambda_var
+        
+    def forward(self, predictions, targets):
+        """
+        Calculate combined loss with weighted MAE and variance regularization.
+        
+        Args:
+            predictions (torch.Tensor): Model predictions (B, 1)
+            targets (torch.Tensor): Ground truth values (B, 1)
+            
+        Returns:
+            torch.Tensor: Combined loss
+        """
+        # Base loss is absolute error (L1)
+        mae = torch.abs(predictions - targets)
+        
+        # Calculate weights based on target values
+        # Higher targets (more severe depression) get higher weights
+        weights = 1.0 + self.scale_factor * targets
+        
+        # Apply weights to the loss
+        weighted_mae = mae * weights
+        weighted_mae = weighted_mae.mean()
+        
+        # Calculate variance of predictions
+        variance = torch.var(predictions)
+        
+        # Penalty if variance is too low
+        variance_penalty = torch.max(torch.tensor(0.0, device=predictions.device), 
+                                    self.min_variance - variance)
+        
+        # Combined loss with both weighting and variance regularization
+        total_loss = weighted_mae + self.lambda_var * variance_penalty
+        
+        return total_loss
+
 class Trainer:
     def __init__(self, model, train_dataset, val_dataset, batch_size, learning_rate, save_dir, criterion=None):
         self.model = model
@@ -81,8 +135,56 @@ class Trainer:
             min_lr=1e-8
         )
 
-        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
+        # Create stratified sampler for training data
+        train_sampler = self.get_balanced_sampler(self.train_dataset)
+        
+        # DataLoader with stratified sampling for training
+        self.train_loader = DataLoader(
+            self.train_dataset, 
+            batch_size=self.batch_size, 
+            sampler=train_sampler
+        )
+        
+        # Use regular DataLoader for validation (no need for stratification)
         self.val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size)
+        
+        print("Using stratified sampling for training data to balance depression severity levels")
+    
+    def get_balanced_sampler(self, dataset):
+        """
+        Create a sampler that over-samples from minority classes and under-samples from majority classes.
+        
+        Args:
+            dataset: The dataset to sample from
+            
+        Returns:
+            WeightedRandomSampler: Sampler that balances classes
+        """
+        # Extract labels
+        labels = np.array(dataset.labels)
+        
+        # Convert PHQ-8 scores to severity levels (0-4)
+        # 0-4: None/minimal, 5-9: Mild, 10-14: Moderate, 15-19: Moderately severe, 20-24: Severe
+        severity_levels = np.digitize(labels, bins=[0, 5, 10, 15, 20, 25]) - 1
+        
+        # Count samples in each severity level
+        level_counts = np.bincount(severity_levels)
+        
+        # Print class distribution for information
+        level_names = ['None/Minimal', 'Mild', 'Moderate', 'Mod. Severe', 'Severe']
+        print("Class distribution before sampling:")
+        for i, name in enumerate(level_names):
+            if i < len(level_counts):
+                print(f"  {name}: {level_counts[i]} samples ({level_counts[i]/len(severity_levels)*100:.1f}%)")
+            else:
+                print(f"  {name}: 0 samples (0.0%)")
+        
+        # Calculate weights (inverse of frequency)
+        # We add a small epsilon to prevent division by zero
+        weights = 1.0 / (level_counts[severity_levels] + 1e-8)
+        
+        # Create and return sampler
+        return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
 
     def visualize_metrics(self, history, best_epoch):
         """
@@ -238,7 +340,9 @@ class Trainer:
             'val_threshold_5_acc': [], 'val_threshold_10_acc': [],
             'val_threshold_15_acc': [], 'val_threshold_20_acc': [],
             'val_rmse': [], 'val_mae': [], 'val_r2': [],
-            'learning_rates': []
+            'learning_rates': [],
+            'train_precision': [], 'train_recall': [], 'train_f1': [],
+            'val_precision': [], 'val_recall': [], 'val_f1': [],
         }
 
         print(f"Starting training on device: {self.device}")
@@ -255,10 +359,12 @@ class Trainer:
 
             # Unpack metrics (updated to include score tolerance metrics)
             train_loss, train_binary_acc, train_overall_acc, (train_level_acc, train_level_accs), \
-                (train_score_tol_acc, train_threshold_accs), train_rmse, train_mae, train_r2 = train_metrics
+                (train_score_tol_acc, train_threshold_accs), train_rmse, train_mae, train_r2, \
+                train_precision, train_recall, train_f1 = train_metrics
             
             val_loss, val_binary_acc, val_overall_acc, (val_level_acc, val_level_accs), \
-                (val_score_tol_acc, val_threshold_accs), val_rmse, val_mae, val_r2 = val_metrics
+                (val_score_tol_acc, val_threshold_accs), val_rmse, val_mae, val_r2, \
+                val_precision, val_recall, val_f1 = val_metrics
             
             # Update learning rate scheduler based on validation MAE
             self.scheduler.step(val_mae)
@@ -290,10 +396,17 @@ class Trainer:
             history['val_rmse'].append(val_rmse)
             history['val_mae'].append(val_mae)
             history['val_r2'].append(val_r2)
+            history['train_precision'].append(train_precision)
+            history['train_recall'].append(train_recall)
+            history['train_f1'].append(train_f1)
+            history['val_precision'].append(val_precision)
+            history['val_recall'].append(val_recall)
+            history['val_f1'].append(val_f1)
 
             # Print metrics with all threshold metrics shown
             print(f'Epoch [{epoch + 1}/{epochs}]: (LR: {current_lr:.6f})')
             print(f'  Train - Loss (MAE): {train_loss:.4f}, Binary: {train_binary_acc:.4f}, Overall: {train_overall_acc:.4f}')
+            print(f'          Precision: {train_precision:.4f}, Recall: {train_recall:.4f}, F1: {train_f1:.4f}')
             print(f'          Score-Tol: {train_score_tol_acc:.4f} (±2 pts)')
             print(f'          Thresholds: [T5: {train_threshold_accs.get("Minimal/Mild (5)", 0.0):.4f}, ' +
                   f'T10: {train_threshold_accs.get("Mild/Moderate (10)", 0.0):.4f}, ' +
@@ -302,8 +415,9 @@ class Trainer:
             print(f'          Per-level: {train_level_acc:.4f} (exact) [None: {train_level_accs[0]:.4f}, Mild: {train_level_accs[1]:.4f}, Mod: {train_level_accs[2]:.4f}, Sev+: {train_level_accs[3]:.4f}, Severe: {train_level_accs[4]:.4f}]')
             print(f'          RMSE: {train_rmse:.4f}, MAE: {train_mae:.4f}, R²: {train_r2:.4f}')
             print(f'  Val   - Loss (MAE): {val_loss:.4f}, Binary: {val_binary_acc:.4f}, Overall: {val_overall_acc:.4f}')
+            print(f'          Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, F1: {val_f1:.4f}')
             print(f'          Score-Tol: {val_score_tol_acc:.4f} (±2 pts)')
-            print(f'          Thresholds: [T5: {val_threshold_accs.get("Minimal/Mild (5)", 0.0):.4f}, ' +
+            print(f'          Thresholds: [T5: {val_threshold_accs.get("Minimal/Mild (5)", 0.0): .4f}, ' +
                   f'T10: {val_threshold_accs.get("Mild/Moderate (10)", 0.0):.4f}, ' +
                   f'T15: {val_threshold_accs.get("Moderate/Mod.Severe (15)", 0.0):.4f}, ' +
                   f'T20: {val_threshold_accs.get("Mod.Severe/Severe (20)", 0.0):.4f}]')
@@ -406,6 +520,28 @@ def calculate_regression_metrics(predictions, targets):
     
     return rmse, mae, r2
 
+def calculate_classification_metrics(predictions, targets, threshold=10.0):
+    """
+    Calculate binary classification metrics (precision, recall, F1).
+    
+    Args:
+        predictions (torch.Tensor): Model's predicted depression scores
+        targets (torch.Tensor): Ground truth depression scores
+        threshold (float): Clinical threshold for depression (default: 10.0)
+        
+    Returns:
+        tuple: (precision, recall, f1)
+    """
+    # Convert regression outputs to binary predictions
+    binary_preds = (predictions.detach().cpu().numpy() > threshold).astype(int).flatten()
+    binary_targets = (targets.detach().cpu().numpy() > threshold).astype(int).flatten()
+    
+    # Calculate precision, recall, and F1 score
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        binary_targets, binary_preds, average='binary', zero_division=0)
+    
+    return precision, recall, f1
+
 def train_epoch(model, data_loader, optimizer, criterion, device):
     model.train()
     running_loss = 0.0
@@ -452,6 +588,9 @@ def train_epoch(model, data_loader, optimizer, criterion, device):
     # Calculate regression metrics
     rmse, mae, r2 = calculate_regression_metrics(predictions, targets)
     
+    # Calculate binary classification metrics
+    precision, recall, f1 = calculate_classification_metrics(predictions, targets, threshold=10.0)
+    
     # Calculate final metrics
     epoch_loss = running_loss / total_samples
     epoch_binary_acc = running_binary_acc / total_samples
@@ -465,7 +604,7 @@ def train_epoch(model, data_loader, optimizer, criterion, device):
     # Calculate score tolerance accuracy on all predictions
     score_tolerance_tuple = model.calculate_score_tolerance_accuracy(predictions, targets, tolerance=2.0)
     
-    return epoch_loss, epoch_binary_acc, epoch_overall_acc, epoch_level_acc_tuple, score_tolerance_tuple, rmse, mae, r2
+    return epoch_loss, epoch_binary_acc, epoch_overall_acc, epoch_level_acc_tuple, score_tolerance_tuple, rmse, mae, r2, precision, recall, f1
 
 def validate_epoch(model, data_loader, criterion, device):
     model.eval()
@@ -510,6 +649,9 @@ def validate_epoch(model, data_loader, criterion, device):
     # Calculate regression metrics
     rmse, mae, r2 = calculate_regression_metrics(predictions, targets)
     
+    # Calculate binary classification metrics
+    precision, recall, f1 = calculate_classification_metrics(predictions, targets, threshold=10.0)
+    
     # Calculate final metrics
     val_loss = running_loss / total_samples
     val_binary_acc = running_binary_acc / total_samples
@@ -523,4 +665,4 @@ def validate_epoch(model, data_loader, criterion, device):
     # Calculate score tolerance accuracy on all predictions
     score_tolerance_tuple = model.calculate_score_tolerance_accuracy(predictions, targets, tolerance=2.0)
     
-    return val_loss, val_binary_acc, val_overall_acc, val_level_acc_tuple, score_tolerance_tuple, rmse, mae, r2
+    return val_loss, val_binary_acc, val_overall_acc, val_level_acc_tuple, score_tolerance_tuple, rmse, mae, r2, precision, recall, f1
