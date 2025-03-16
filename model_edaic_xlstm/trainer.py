@@ -14,8 +14,50 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from datetime import datetime
 
+# Add WeightedMAELoss class directly to trainer.py
+class WeightedMAELoss(nn.Module):
+    """
+    Weighted Mean Absolute Error loss that gives higher importance to higher PHQ-8 scores.
+    This helps address class imbalance by making errors on underrepresented higher severity
+    depression scores more costly.
+    """
+    def __init__(self, scale_factor=0.2):
+        """
+        Initialize weighted MAE loss.
+        
+        Args:
+            scale_factor (float): Controls how much weight increases with target value.
+                                 Higher values give more emphasis to high PHQ-8 scores.
+        """
+        super(WeightedMAELoss, self).__init__()
+        self.scale_factor = scale_factor
+        
+    def forward(self, predictions, targets):
+        """
+        Calculate weighted MAE loss.
+        
+        Args:
+            predictions (torch.Tensor): Model predictions (B, 1)
+            targets (torch.Tensor): Ground truth values (B, 1)
+            
+        Returns:
+            torch.Tensor: Weighted MAE loss
+        """
+        # Base loss is absolute error (L1)
+        mae = torch.abs(predictions - targets)
+        
+        # Calculate weights based on target values
+        # Higher targets (more severe depression) get higher weights
+        weights = 1.0 + self.scale_factor * targets
+        
+        # Apply weights to the loss
+        weighted_mae = mae * weights
+        
+        # Return mean loss
+        return weighted_mae.mean()
+
 class Trainer:
-    def __init__(self, model, train_dataset, val_dataset, batch_size, learning_rate, save_dir):
+    def __init__(self, model, train_dataset, val_dataset, batch_size, learning_rate, save_dir, criterion=None):
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -26,8 +68,8 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
-        # Change from MSE to MAE loss
-        self.criterion = nn.L1Loss()  # L1Loss is PyTorch's implementation of MAE
+        # Use custom criterion if provided, otherwise default to MAE loss
+        self.criterion = criterion if criterion is not None else nn.L1Loss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         # Add learning rate scheduler
         self.scheduler = ReduceLROnPlateau(

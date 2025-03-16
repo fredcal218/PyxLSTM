@@ -61,7 +61,7 @@ class EDAICDataset(Dataset):
         return depression_scores
 
     def _process_participant(self, participant_id, folder):
-        """Process a single participant's data into sequences"""
+        """Process a single participant's data into sequences with adaptive stride based on PHQ score"""
         # Path to the features CSV file
         file_path = os.path.join(self.data_dir, folder, 'features',
                                f"{participant_id}_OpenFace2.1.0_Pose_gaze_AUs.csv")
@@ -75,16 +75,29 @@ class EDAICDataset(Dataset):
             print(f"Warning: No depression score found for participant {participant_id}")
             return
 
+        # Get participant's PHQ score
+        phq_score = self.depression_scores[participant_id]
+        
+        # Determine stride based on depression severity
+        # Use smaller stride for higher severity to generate more sequences
+        if (phq_score >= 20):  # Severe (20-24)
+            effective_stride = max(1, self.stride // 5)  # Generate ~5x more sequences
+        elif (phq_score >= 15):  # Moderately severe (15-19)
+            effective_stride = max(1, self.stride // 3)  # Generate ~3x more sequences
+        elif (phq_score >= 10):  # Moderate (10-14)
+            effective_stride = max(1, self.stride // 2)  # Generate ~2x more sequences
+        else:
+            effective_stride = self.stride  # Normal stride for mild/minimal
+        
         # Load data
         try:
             df = pd.read_csv(file_path)
             
-            # Sample only 1/10 of the frames
+            # Sample only 1/n of the frames
             df = df.iloc[::self.frame_step].reset_index(drop=True)
             
-            # Adjust sequence length and stride for reduced frame rate
+            # Use adaptive sequence length
             effective_seq_length = self.seq_length
-            effective_stride = self.stride
 
             # Filter feature columns
             # Keep only pose, gaze, and AU intensity features
@@ -113,11 +126,13 @@ class EDAICDataset(Dataset):
                 print(f"  - AU intensity features: {len(au_intensity_cols)}")
                 print(f"  - Excluded AU confidence features: {len([c for c in df.columns if 'AU' in c and c.endswith('_c')])}")
                 print(f"  - Original frame count: {len(df) * self.frame_step} → Downsampled: {len(df)}")
+                print(f"  - Using adaptive stride: Minimal/Mild={self.stride}, Moderate={self.stride//2}, "
+                      f"Mod.Severe={self.stride//3}, Severe={self.stride//5}")
 
             # Handle missing values - replace NaN with 0
             features = np.nan_to_num(features, nan=0.0)
 
-            # Create sequences using sliding window
+            # Create sequences using adaptive stride (more sequences for higher PHQ scores)
             for i in range(0, max(1, len(features) - effective_seq_length + 1), effective_stride):
                 seq = features[i:i+effective_seq_length]
                 
@@ -129,7 +144,7 @@ class EDAICDataset(Dataset):
                 self.samples.append(seq)
 
                 # Add depression score as label
-                self.labels.append(self.depression_scores[participant_id])
+                self.labels.append(phq_score)
         except Exception as e:
             print(f"Error processing participant {participant_id}: {e}")
 

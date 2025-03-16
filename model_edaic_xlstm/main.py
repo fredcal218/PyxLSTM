@@ -8,7 +8,7 @@ from datetime import datetime
 
 from model import EDAIC_LSTM
 from dataset import EDAICDataset
-from trainer import Trainer, validate_epoch
+from trainer import Trainer, validate_epoch, WeightedMAELoss  # Import WeightedMAELoss from trainer
 
 def set_seed(seed):
     """Set seeds for reproducibility"""
@@ -130,20 +130,22 @@ def main():
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.L1Loss()  # Change to MAE (L1Loss)
     
-    # Update hyperparameters to reflect MAE loss
-    hyperparams["training"]["loss_function"] = "MAE (L1Loss)"
+    # Use weighted MAE loss instead of standard MAE
+    criterion = WeightedMAELoss(scale_factor=0.2)  # Higher weight for higher PHQ scores
     
-    # Create trainer
+    # Update hyperparameters to reflect weighted loss
+    hyperparams["training"]["loss_function"] = "Weighted MAE (scale_factor=0.2)"
+    
+    # Create trainer with our custom loss
     trainer = Trainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        save_dir=save_dir
+        save_dir=save_dir,
+        criterion=criterion  # Pass custom loss to trainer
     )
     
     # Train model with early stopping and LR scheduling
