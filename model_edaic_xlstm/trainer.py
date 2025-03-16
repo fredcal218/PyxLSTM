@@ -26,16 +26,17 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
-        self.criterion = nn.MSELoss()
+        # Change from MSE to MAE loss
+        self.criterion = nn.L1Loss()  # L1Loss is PyTorch's implementation of MAE
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         # Add learning rate scheduler
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, 
             mode='min', 
             factor=0.5,  # Reduce LR by half when plateauing
-            patience=15,  # Wait for 15 epochs before reducing LR
+            patience=10,  # Wait for 15 epochs before reducing LR
             verbose=True, 
-            min_lr=1e-6
+            min_lr=1e-8
         )
 
         self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
@@ -151,28 +152,56 @@ class Trainer:
         plt.savefig(os.path.join(plots_dir, 'per_level_accuracies.png'), dpi=300)
         plt.close()
         
+        # Plot 4: Threshold Accuracies
+        plt.figure(figsize=(12, 8))
+        threshold_values = [5, 10, 15, 20]
+        
+        for i, threshold in enumerate(threshold_values):
+            plt.plot(epochs, history_cpu[f'val_threshold_{threshold}_acc'], 
+                     label=f'T{threshold}', 
+                     marker='o', 
+                     markersize=4)
+        
+        plt.axvline(x=best_epoch, color='r', linestyle='--', label=f'Best Model (Epoch {best_epoch})')
+        plt.title('Threshold Accuracies over Epochs (±2 points near threshold)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, 'threshold_accuracies.png'), dpi=300)
+        plt.close()
+        
         print(f"Saved visualization plots to {plots_dir}")
 
     def train(self, epochs, patience, seed):
-        best_val_loss = float('inf')
+        best_val_mae = float('inf')  # Track MAE instead of loss for early stopping
         patience_counter = 0
         best_epoch = 0
         
-        # Update history to include per-level accuracies
+        # Update history to include per-level accuracies and score tolerance metrics
         history = {
             'train_loss': [], 'train_binary_acc': [], 'train_overall_acc': [], 'train_level_acc': [],
             'train_level0_acc': [], 'train_level1_acc': [], 'train_level2_acc': [], 
             'train_level3_acc': [], 'train_level4_acc': [],
+            'train_score_tolerance_acc': [], 
+            'train_threshold_5_acc': [], 'train_threshold_10_acc': [],
+            'train_threshold_15_acc': [], 'train_threshold_20_acc': [],
             'train_rmse': [], 'train_mae': [], 'train_r2': [],
             'val_loss': [], 'val_binary_acc': [], 'val_overall_acc': [], 'val_level_acc': [],
             'val_level0_acc': [], 'val_level1_acc': [], 'val_level2_acc': [], 
             'val_level3_acc': [], 'val_level4_acc': [],
+            'val_score_tolerance_acc': [],
+            'val_threshold_5_acc': [], 'val_threshold_10_acc': [],
+            'val_threshold_15_acc': [], 'val_threshold_20_acc': [],
             'val_rmse': [], 'val_mae': [], 'val_r2': [],
             'learning_rates': []
         }
 
         print(f"Starting training on device: {self.device}")
         print(f"Initial learning rate: {self.learning_rate}")
+        print(f"Using L1Loss (MAE) as criterion")
         
         for epoch in range(epochs):
             # Store current learning rate
@@ -182,20 +211,28 @@ class Trainer:
             train_metrics = train_epoch(self.model, self.train_loader, self.optimizer, self.criterion, self.device)
             val_metrics = validate_epoch(self.model, self.val_loader, self.criterion, self.device)
 
-            # Unpack metrics
-            train_loss, train_binary_acc, train_overall_acc, (train_level_acc, train_level_accs), train_rmse, train_mae, train_r2 = train_metrics
-            val_loss, val_binary_acc, val_overall_acc, (val_level_acc, val_level_accs), val_rmse, val_mae, val_r2 = val_metrics
+            # Unpack metrics (updated to include score tolerance metrics)
+            train_loss, train_binary_acc, train_overall_acc, (train_level_acc, train_level_accs), \
+                (train_score_tol_acc, train_threshold_accs), train_rmse, train_mae, train_r2 = train_metrics
             
-            # Update learning rate scheduler based on validation loss
-            self.scheduler.step(val_loss)
+            val_loss, val_binary_acc, val_overall_acc, (val_level_acc, val_level_accs), \
+                (val_score_tol_acc, val_threshold_accs), val_rmse, val_mae, val_r2 = val_metrics
             
-            # Store metrics in history
+            # Update learning rate scheduler based on validation MAE
+            self.scheduler.step(val_mae)
+            
+            # Store metrics in history (updated for score tolerance metrics)
             history['train_loss'].append(train_loss)
             history['train_binary_acc'].append(train_binary_acc)
             history['train_overall_acc'].append(train_overall_acc)
             history['train_level_acc'].append(train_level_acc)
             for i, acc in enumerate(train_level_accs):
                 history[f'train_level{i}_acc'].append(acc)
+            history['train_score_tolerance_acc'].append(train_score_tol_acc)
+            threshold_names = ["Minimal/Mild (5)", "Mild/Moderate (10)", 
+                              "Moderate/Mod.Severe (15)", "Mod.Severe/Severe (20)"]
+            for i, name in enumerate(threshold_names):
+                history[f'train_threshold_{[5, 10, 15, 20][i]}_acc'].append(train_threshold_accs.get(name, 0.0))
             history['train_rmse'].append(train_rmse)
             history['train_mae'].append(train_mae)
             history['train_r2'].append(train_r2)
@@ -205,35 +242,49 @@ class Trainer:
             history['val_level_acc'].append(val_level_acc)
             for i, acc in enumerate(val_level_accs):
                 history[f'val_level{i}_acc'].append(acc)
+            history['val_score_tolerance_acc'].append(val_score_tol_acc)
+            for i, name in enumerate(threshold_names):
+                history[f'val_threshold_{[5, 10, 15, 20][i]}_acc'].append(val_threshold_accs.get(name, 0.0))
             history['val_rmse'].append(val_rmse)
             history['val_mae'].append(val_mae)
             history['val_r2'].append(val_r2)
 
-            # Print metrics with level-specific accuracies
+            # Print metrics with all threshold metrics shown
             print(f'Epoch [{epoch + 1}/{epochs}]: (LR: {current_lr:.6f})')
-            print(f'  Train - Loss: {train_loss:.4f}, Binary: {train_binary_acc:.4f}, Overall: {train_overall_acc:.4f}')
-            print(f'          Per-level: {train_level_acc:.4f} [None: {train_level_accs[0]:.4f}, Mild: {train_level_accs[1]:.4f}, Mod: {train_level_accs[2]:.4f}, Sev+: {train_level_accs[3]:.4f}, Severe: {train_level_accs[4]:.4f}]')
+            print(f'  Train - Loss (MAE): {train_loss:.4f}, Binary: {train_binary_acc:.4f}, Overall: {train_overall_acc:.4f}')
+            print(f'          Score-Tol: {train_score_tol_acc:.4f} (±2 pts)')
+            print(f'          Thresholds: [T5: {train_threshold_accs.get("Minimal/Mild (5)", 0.0):.4f}, ' +
+                  f'T10: {train_threshold_accs.get("Mild/Moderate (10)", 0.0):.4f}, ' +
+                  f'T15: {train_threshold_accs.get("Moderate/Mod.Severe (15)", 0.0):.4f}, ' +
+                  f'T20: {train_threshold_accs.get("Mod.Severe/Severe (20)", 0.0):.4f}]')
+            print(f'          Per-level: {train_level_acc:.4f} (exact) [None: {train_level_accs[0]:.4f}, Mild: {train_level_accs[1]:.4f}, Mod: {train_level_accs[2]:.4f}, Sev+: {train_level_accs[3]:.4f}, Severe: {train_level_accs[4]:.4f}]')
             print(f'          RMSE: {train_rmse:.4f}, MAE: {train_mae:.4f}, R²: {train_r2:.4f}')
-            print(f'  Val   - Loss: {val_loss:.4f}, Binary: {val_binary_acc:.4f}, Overall: {val_overall_acc:.4f}')
-            print(f'          Per-level: {val_level_acc:.4f} [None: {val_level_accs[0]:.4f}, Mild: {val_level_accs[1]:.4f}, Mod: {val_level_accs[2]:.4f}, Sev+: {val_level_accs[3]:.4f}, Severe: {val_level_accs[4]:.4f}]')
+            print(f'  Val   - Loss (MAE): {val_loss:.4f}, Binary: {val_binary_acc:.4f}, Overall: {val_overall_acc:.4f}')
+            print(f'          Score-Tol: {val_score_tol_acc:.4f} (±2 pts)')
+            print(f'          Thresholds: [T5: {val_threshold_accs.get("Minimal/Mild (5)", 0.0):.4f}, ' +
+                  f'T10: {val_threshold_accs.get("Mild/Moderate (10)", 0.0):.4f}, ' +
+                  f'T15: {val_threshold_accs.get("Moderate/Mod.Severe (15)", 0.0):.4f}, ' +
+                  f'T20: {val_threshold_accs.get("Mod.Severe/Severe (20)", 0.0):.4f}]')
+            print(f'          Per-level: {val_level_acc:.4f} (exact) [None: {val_level_accs[0]:.4f}, Mild: {val_level_accs[1]:.4f}, Mod: {val_level_accs[2]:.4f}, Sev+: {val_level_accs[3]:.4f}, Severe: {val_level_accs[4]:.4f}]')
             print(f'          RMSE: {val_rmse:.4f}, MAE: {val_mae:.4f}, R²: {val_r2:.4f}')
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            # Use MAE for early stopping instead of loss
+            if val_mae < best_val_mae:
+                best_val_mae = val_mae
                 best_epoch = epoch + 1
                 patience_counter = 0
-                print(f"  New best model! Saving checkpoint (val_loss: {val_loss:.4f})")
+                print(f"  New best model! Saving checkpoint (val_mae: {val_mae:.4f})")
                 self.save_model()
                 
                 # Create and save visualization plots for current best model
                 self.visualize_metrics(history, best_epoch)
             else:
                 patience_counter += 1
-                print(f"  No improvement for {patience_counter}/{patience} epochs (best val_loss: {best_val_loss:.4f} @ epoch {best_epoch})")
+                print(f"  No improvement for {patience_counter}/{patience} epochs (best val_mae: {best_val_mae:.4f} @ epoch {best_epoch})")
 
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch + 1} epochs.")
-                print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+                print(f"Best validation MAE: {best_val_mae:.4f} at epoch {best_epoch}")
                 
                 # Final visualization after early stopping
                 self.visualize_metrics(history, best_epoch)
@@ -255,7 +306,7 @@ class Trainer:
         
         print(f"Training history saved to {history_path}")
         print(f"Training completed after {len(history['train_loss'])} epochs")
-        print(f"Best model was at epoch {best_epoch} with validation loss {best_val_loss:.4f}")
+        print(f"Best model was at epoch {best_epoch} with validation MAE: {best_val_mae:.4f}")
         
         return history
 
@@ -338,6 +389,7 @@ def train_epoch(model, data_loader, optimizer, criterion, device):
         binary_acc = model.calculate_accuracy(outputs, targets)
         overall_acc = model.calculate_overall_accuracy(outputs, targets)
         level_acc_tuple = model.calculate_per_level_accuracy(outputs, targets)
+        score_tolerance_tuple = model.calculate_score_tolerance_accuracy(outputs, targets, tolerance=2.0)
         
         # Store predictions and targets for metric calculation
         all_predictions.append(outputs.detach())
@@ -368,7 +420,10 @@ def train_epoch(model, data_loader, optimizer, criterion, device):
     if len(all_predictions) > 0 and len(all_targets) > 0:
         epoch_level_acc_tuple = model.calculate_per_level_accuracy(predictions, targets)
     
-    return epoch_loss, epoch_binary_acc, epoch_overall_acc, epoch_level_acc_tuple, rmse, mae, r2
+    # Calculate score tolerance accuracy on all predictions
+    score_tolerance_tuple = model.calculate_score_tolerance_accuracy(predictions, targets, tolerance=2.0)
+    
+    return epoch_loss, epoch_binary_acc, epoch_overall_acc, epoch_level_acc_tuple, score_tolerance_tuple, rmse, mae, r2
 
 def validate_epoch(model, data_loader, criterion, device):
     model.eval()
@@ -392,6 +447,7 @@ def validate_epoch(model, data_loader, criterion, device):
             binary_acc = model.calculate_accuracy(outputs, targets)
             overall_acc = model.calculate_overall_accuracy(outputs, targets)
             level_acc_tuple = model.calculate_per_level_accuracy(outputs, targets)
+            score_tolerance_tuple = model.calculate_score_tolerance_accuracy(outputs, targets, tolerance=2.0)
             
             # Store predictions and targets for metric calculation
             all_predictions.append(outputs)
@@ -422,4 +478,7 @@ def validate_epoch(model, data_loader, criterion, device):
     if len(all_predictions) > 0 and len(all_targets) > 0:
         val_level_acc_tuple = model.calculate_per_level_accuracy(predictions, targets)
     
-    return val_loss, val_binary_acc, val_overall_acc, val_level_acc_tuple, rmse, mae, r2
+    # Calculate score tolerance accuracy on all predictions
+    score_tolerance_tuple = model.calculate_score_tolerance_accuracy(predictions, targets, tolerance=2.0)
+    
+    return val_loss, val_binary_acc, val_overall_acc, val_level_acc_tuple, score_tolerance_tuple, rmse, mae, r2

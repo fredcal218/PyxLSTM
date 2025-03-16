@@ -5,7 +5,7 @@ import numpy as np
 import os
 
 class EDAICDataset(Dataset):
-    def __init__(self, base_dir, split='train', seq_length=150, stride=50, transform=None):
+    def __init__(self, base_dir, split='train', seq_length=150, stride=50, transform=None, frame_step=10):
         """
         Dataset for E-DAIC data using the predefined split structure.
 
@@ -15,12 +15,14 @@ class EDAICDataset(Dataset):
             seq_length (int): Length of sequences to sample
             stride (int): Stride between consecutive sequences
             transform (callable, optional): Optional transform to be applied on samples
+            frame_step (int): Sample every nth frame (default: 10)
         """
         self.base_dir = base_dir
         self.split = split
         self.seq_length = seq_length
         self.stride = stride
         self.transform = transform
+        self.frame_step = frame_step  # Sample every nth frame
 
         self.data_dir = os.path.join(base_dir, 'data_extr', split)
         self.labels_path = os.path.join(base_dir, 'labels', f'{split}_split.csv')
@@ -40,6 +42,7 @@ class EDAICDataset(Dataset):
             self._process_participant(participant_id, folder)
 
         print(f"Loaded {split} set with {len(self.samples)} sequences from {len(participant_folders)} participants")
+        print(f"Using frame step {frame_step} (1/{frame_step} of original frames)")
 
     def _load_depression_scores(self):
         """Load depression scores from the dataset labels CSV"""
@@ -75,6 +78,13 @@ class EDAICDataset(Dataset):
         # Load data
         try:
             df = pd.read_csv(file_path)
+            
+            # Sample only 1/10 of the frames
+            df = df.iloc[::self.frame_step].reset_index(drop=True)
+            
+            # Adjust sequence length and stride for reduced frame rate
+            effective_seq_length = self.seq_length
+            effective_stride = self.stride
 
             # Filter feature columns
             # Keep only pose, gaze, and AU intensity features
@@ -102,13 +112,20 @@ class EDAICDataset(Dataset):
                 print(f"  - Pose/gaze features: {len(pose_gaze_cols)}")
                 print(f"  - AU intensity features: {len(au_intensity_cols)}")
                 print(f"  - Excluded AU confidence features: {len([c for c in df.columns if 'AU' in c and c.endswith('_c')])}")
+                print(f"  - Original frame count: {len(df) * self.frame_step} → Downsampled: {len(df)}")
 
             # Handle missing values - replace NaN with 0
             features = np.nan_to_num(features, nan=0.0)
 
             # Create sequences using sliding window
-            for i in range(0, len(features) - self.seq_length + 1, self.stride):
-                seq = features[i:i+self.seq_length]
+            for i in range(0, max(1, len(features) - effective_seq_length + 1), effective_stride):
+                seq = features[i:i+effective_seq_length]
+                
+                # Pad sequence if needed (for last incomplete sequence)
+                if len(seq) < effective_seq_length:
+                    padding = np.zeros((effective_seq_length - len(seq), seq.shape[1]))
+                    seq = np.vstack([seq, padding])
+                    
                 self.samples.append(seq)
 
                 # Add depression score as label

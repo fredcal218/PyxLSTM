@@ -123,7 +123,7 @@ class EDAIC_LSTM(nn.Module):
         
         return correct / total
     
-    def calculate_overall_accuracy(self, predictions, targets, tolerance=1.0):
+    def calculate_overall_accuracy(self, predictions, targets, tolerance=2.0):
         """
         Calculate overall accuracy for depression scores with tolerance.
         
@@ -166,7 +166,7 @@ class EDAIC_LSTM(nn.Module):
         level_thresholds = torch.tensor([0, 5, 10, 15, 20, 25], device=predictions.device)
         level_names = ['None/Minimal', 'Mild', 'Moderate', 'Mod. Severe', 'Severe']
         
-        # Convert predictions to levels
+        # Convert predictions and targets to levels
         pred_levels = torch.zeros_like(predictions, dtype=torch.long)
         target_levels = torch.zeros_like(targets, dtype=torch.long)
         
@@ -179,7 +179,7 @@ class EDAIC_LSTM(nn.Module):
         pred_levels[predictions >= level_thresholds[-1]] = len(level_thresholds) - 2
         target_levels[targets >= level_thresholds[-1]] = len(level_thresholds) - 2
         
-        # Calculate overall accuracy
+        # Calculate overall accuracy (exact match only, no tolerance)
         correct = (pred_levels == target_levels).float().sum()
         total = target_levels.numel()
         overall_accuracy = (correct / total).item() if total > 0 else 0.0
@@ -192,7 +192,7 @@ class EDAIC_LSTM(nn.Module):
             level_count = level_mask.sum().item()
             
             if level_count > 0:
-                # Calculate accuracy for this level
+                # Calculate accuracy for this level (exact match only)
                 level_correct = ((pred_levels == i) & level_mask).float().sum()
                 level_accuracy = (level_correct / level_count).item()
             else:
@@ -201,3 +201,48 @@ class EDAIC_LSTM(nn.Module):
             level_accuracies.append(level_accuracy)
         
         return overall_accuracy, level_accuracies
+
+    def calculate_score_tolerance_accuracy(self, predictions, targets, tolerance=2.0):
+        """
+        Calculate accuracy based on raw PHQ-8 scores with tolerance.
+        This handles edge cases near category thresholds by applying
+        tolerance directly to the scores before categorization.
+        
+        Args:
+            predictions (torch.Tensor): Model's predicted depression scores
+            targets (torch.Tensor): Ground truth depression scores
+            tolerance (float): Score difference tolerance (default: 2.0)
+                              A prediction is correct if |pred - target| <= tolerance
+            
+        Returns:
+            tuple: (overall_accuracy, per_threshold_accuracies)
+                - overall_accuracy: float, percentage of predictions within tolerance
+                - per_threshold_accuracies: dict, accuracy near each threshold
+        """
+        # Consider prediction correct if within tolerance range of target
+        correct_predictions = (torch.abs(predictions - targets) <= tolerance).float()
+        overall_accuracy = correct_predictions.mean().item()
+        
+        # Define PHQ level thresholds for analyzing performance near boundaries
+        thresholds = [5, 10, 15, 20]
+        threshold_names = ["Minimal/Mild (5)", "Mild/Moderate (10)", 
+                          "Moderate/Mod.Severe (15)", "Mod.Severe/Severe (20)"]
+        
+        # For each threshold, calculate accuracy for samples near that threshold
+        # "Near" means within ±2 points of the threshold
+        threshold_range = 2.0
+        per_threshold_accuracies = {}
+        
+        for i, threshold in enumerate(thresholds):
+            # Find samples where the target is near the threshold
+            near_threshold_mask = (torch.abs(targets - threshold) <= threshold_range).bool()
+            
+            # If we have samples near this threshold
+            if near_threshold_mask.sum() > 0:
+                # Calculate accuracy for these samples
+                threshold_correct = correct_predictions[near_threshold_mask].float().mean().item()
+                per_threshold_accuracies[threshold_names[i]] = threshold_correct
+            else:
+                per_threshold_accuracies[threshold_names[i]] = 0.0
+                
+        return overall_accuracy, per_threshold_accuracies
