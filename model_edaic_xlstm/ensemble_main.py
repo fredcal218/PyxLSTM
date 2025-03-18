@@ -28,21 +28,21 @@ def main():
     # Hard-coded parameters
     base_dir = 'E-DAIC'  
     save_dir = os.path.join('model_edaic_xlstm', 'ensemble_checkpoints')
-    epochs = 300
-    patience = 30  
+    epochs = 50
+    patience = 5  
     
     # Reduce batch size for ensemble training to prevent OOM
-    batch_size = 8
+    batch_size = 16
     
     learning_rate = 0.0001
-    hidden_size = 128  # Reduced from 256
+    hidden_size = 256  
     num_layers = 2
-    dropout = 0.3
+    dropout = 0.5
     
     # Use smaller sequence length for ensemble to avoid OOM
-    ensemble_seq_length = 600  # Reduced sequence length for ensemble training
-    stride = 300
-    frame_step = 5
+    ensemble_seq_length = 900  
+    stride = 450
+    frame_step = 10
     seed = 46
     
     # Enable gradient accumulation steps to simulate larger batch size

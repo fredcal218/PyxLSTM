@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import time
 from tqdm import tqdm
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, precision_recall_fscore_support
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, precision_recall_fscore_support, confusion_matrix, roc_curve, auc
 
 from trainer import calculate_regression_metrics, calculate_classification_metrics
 
@@ -225,7 +225,7 @@ class EnsembleTrainer:
             train_loss, train_mae, train_rmse, train_r2, train_precision, train_recall, train_f1 = train_metrics
             val_loss, val_mae, val_rmse, val_r2, val_precision, val_recall, val_f1 = val_metrics
             
-            # Store metrics
+            # Store metrics in history
             history['train_loss'].append(train_loss)
             history['train_classifier_loss'].append(classifier_loss)
             history['train_low_loss'].append(low_loss)
@@ -259,7 +259,31 @@ class EnsembleTrainer:
                 best_epoch = epoch + 1
                 patience_counter = 0
                 print(f"  New best model! Saving checkpoint (val_mae: {val_mae:.4f})")
-                self._save_model()
+                
+                # Get current metrics to save with the model
+                current_metrics = {
+                    'epoch': epoch + 1,
+                    'train_loss': train_loss,
+                    'train_mae': train_mae,
+                    'train_rmse': train_rmse,
+                    'train_r2': train_r2,
+                    'train_precision': train_precision,
+                    'train_recall': train_recall,
+                    'train_f1': train_f1,
+                    'val_loss': val_loss,
+                    'val_mae': val_mae,
+                    'val_rmse': val_rmse,
+                    'val_r2': val_r2,
+                    'val_precision': val_precision,
+                    'val_recall': val_recall,
+                    'val_f1': val_f1
+                }
+                
+                # Save model and current metrics
+                self._save_model(current_metrics)
+                
+                # Generate and save visualizations
+                self._create_visualizations(history, epoch + 1)
             else:
                 patience_counter += 1
                 print(f"  No improvement for {patience_counter}/{patience} epochs (best val_mae: {best_val_mae:.4f} @ epoch {best_epoch})")
@@ -269,7 +293,7 @@ class EnsembleTrainer:
                 print(f"Best validation MAE: {best_val_mae:.4f} at epoch {best_epoch}")
                 break
         
-        # Save training history
+        # Save final training history
         self._save_history(history)
         
         print(f"Training completed after {len(history['train_loss'])} epochs")
@@ -287,7 +311,10 @@ class EnsembleTrainer:
         criterion = nn.BCELoss()
         self.classifier_optimizer.zero_grad()
         
-        for batch_idx, (inputs, targets) in enumerate(data_loader):
+        # Add progress bar
+        progress_bar = tqdm(data_loader, desc="Training classifier")
+        
+        for batch_idx, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
             
@@ -311,6 +338,9 @@ class EnsembleTrainer:
             running_loss += loss.item() * batch_size * self.gradient_accumulation_steps  # Scale back to get actual loss
             total_samples += batch_size
             
+            # Update progress bar
+            progress_bar.set_postfix({"loss": loss.item() * self.gradient_accumulation_steps})
+            
             # Perform optimizer step every gradient_accumulation_steps
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(data_loader):
                 self.classifier_optimizer.step()
@@ -331,7 +361,10 @@ class EnsembleTrainer:
         criterion = nn.L1Loss()
         self.low_regressor_optimizer.zero_grad()
         
-        for batch_idx, (inputs, targets) in enumerate(data_loader):
+        # Add progress bar
+        progress_bar = tqdm(data_loader, desc="Training low regressor")
+        
+        for batch_idx, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
             
@@ -350,6 +383,9 @@ class EnsembleTrainer:
             batch_size = targets.size(0)
             running_loss += loss.item() * batch_size * self.gradient_accumulation_steps  # Scale back
             total_samples += batch_size
+            
+            # Update progress bar
+            progress_bar.set_postfix({"loss": loss.item() * self.gradient_accumulation_steps})
             
             # Perform optimizer step every gradient_accumulation_steps
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(data_loader):
@@ -371,7 +407,10 @@ class EnsembleTrainer:
         criterion = nn.L1Loss()
         self.high_regressor_optimizer.zero_grad()
         
-        for batch_idx, (inputs, targets) in enumerate(data_loader):
+        # Add progress bar
+        progress_bar = tqdm(data_loader, desc="Training high regressor")
+        
+        for batch_idx, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
             
@@ -391,6 +430,9 @@ class EnsembleTrainer:
             running_loss += loss.item() * batch_size * self.gradient_accumulation_steps  # Scale back
             total_samples += batch_size
             
+            # Update progress bar
+            progress_bar.set_postfix({"loss": loss.item() * self.gradient_accumulation_steps})
+            
             # Perform optimizer step every gradient_accumulation_steps
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(data_loader):
                 self.high_regressor_optimizer.step()
@@ -404,55 +446,35 @@ class EnsembleTrainer:
     def evaluate_with_memory_management(self, data_loader, is_training=False):
         """Evaluate the ensemble model with memory management strategies"""
         phase = "Training" if is_training else "Validation"
-        print(f"\n--- Starting {phase} Evaluation ---")
-        eval_start = time.time()
+        print(f"\n--- {phase} Evaluation ---")
         
         if is_training:
             self.model.train()
-            print("Model in training mode")
         else:
             self.model.eval()
-            print("Model in evaluation mode")
         
         running_loss = 0.0
         all_predictions = []
         all_targets = []
         total_samples = 0
         
+        # Add progress bar for evaluation
+        progress_bar = tqdm(data_loader, desc=f"{phase} evaluation")
+        
         # Process batches with memory management
-        print(f"Processing {len(data_loader)} batches for {phase.lower()} evaluation")
         with torch.set_grad_enabled(is_training):
-            for batch_idx, (inputs, targets) in enumerate(data_loader):
-                batch_start = time.time()
-                print(f"\nBatch {batch_idx+1}/{len(data_loader)} - {phase}")
-                
-                # Extra diagnostic for batch 7
-                if batch_idx == 6:  # 0-indexed, so batch 7 is index 6
-                    print(f"*** DETAILED DIAGNOSTICS FOR BATCH 7 ***")
-                    print(f"Targets shape: {targets.shape}, min: {targets.min()}, max: {targets.max()}")
-                    print(f"Inputs shape: {inputs.shape}, has NaN: {torch.isnan(inputs).any()}, has Inf: {torch.isinf(inputs).any()}")
-                
+            for batch_idx, (inputs, targets) in enumerate(progress_bar):
                 # Move data to device
-                print(f"  Moving batch to {self.device}...")
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
                 # Forward pass through the ensemble
-                print(f"  Running model forward pass...")
                 predictions = self.model(inputs)
                 
-                # Extra diagnostics for batch 7
-                if batch_idx == 6:
-                    print("Prediction stats:")
-                    print(f"  Scores: min={predictions[0].min().item()}, max={predictions[0].max().item()}")
-                    print(f"  Probs: min={predictions[1].min().item()}, max={predictions[1].max().item()}")
-                
-                print(f"  Calculating loss...")
                 try:
                     loss = self.criterion(predictions, targets)
                     
                     # Store predictions and targets on CPU to save GPU memory
-                    print(f"  Moving results to CPU...")
                     all_predictions.append(predictions[0].detach().cpu())
                     all_targets.append(targets.cpu())
                     
@@ -460,6 +482,10 @@ class EnsembleTrainer:
                     batch_size = targets.size(0)
                     running_loss += loss.item() * batch_size
                     total_samples += batch_size
+                    
+                    # Update progress bar with current loss
+                    progress_bar.set_postfix({"loss": loss.item()})
+                    
                 except Exception as e:
                     print(f"ERROR in batch {batch_idx+1}: {str(e)}")
                     print("Skipping this batch and continuing...")
@@ -468,34 +494,23 @@ class EnsembleTrainer:
                 # Clear memory between batches
                 del inputs, predictions, loss
                 torch.cuda.empty_cache()
-                
-                batch_time = time.time() - batch_start
-                print(f"  ✓ Batch {batch_idx+1} processed in {batch_time:.2f}s")
-                
-                # Show memory usage if on CUDA
-                if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-                    max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                    print(f"  CUDA Memory: {allocated:.3f} GB (max: {max_allocated:.3f} GB)")
         
-        print(f"Collecting and processing all results...")
         # Move to CPU for final processing
         all_predictions = torch.cat(all_predictions, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
-        print(f"Calculating metrics...")
         # Calculate metrics
         rmse, mae, r2 = calculate_regression_metrics(all_predictions, all_targets)
         precision, recall, f1 = calculate_classification_metrics(all_predictions, all_targets)
         
-        eval_time = time.time() - eval_start
-        print(f"✓ {phase} evaluation completed in {eval_time:.2f}s")
         return running_loss / total_samples, mae, rmse, r2, precision, recall, f1
     
-    def _save_model(self):
-        """Save the ensemble model"""
+    def _save_model(self, metrics):
+        """Save the ensemble model with metrics"""
         model_path = os.path.join(self.save_dir, 'best_ensemble.pt')
+        metrics_path = os.path.join(self.save_dir, 'best_model_metrics.json')
         
+        # Save model state
         torch.save({
             'binary_classifier': self.model.binary_classifier.state_dict(),
             'low_regressor': self.model.low_regressor.state_dict(),
@@ -505,6 +520,81 @@ class EnsembleTrainer:
             'high_optimizer': self.high_regressor_optimizer.state_dict(),
             'confidence_threshold': self.model.confidence_threshold
         }, model_path)
+        
+        # Save metrics alongside the model
+        with open(metrics_path, 'w') as f:
+            json.dump({k: float(v) if isinstance(v, (torch.Tensor, np.floating)) else v 
+                      for k, v in metrics.items()}, f, indent=2)
+        
+        print(f"Model and metrics saved to {self.save_dir}")
+    
+    def _create_visualizations(self, history, epoch):
+        """Create and save visualizations for model performance"""
+        vis_dir = os.path.join(self.save_dir, 'visualizations')
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 1. Loss curves
+        plt.figure(figsize=(12, 6))
+        plt.plot(history['train_loss'], label='Training Loss')
+        plt.plot(history['val_loss'], label='Validation Loss')
+        plt.axvline(x=epoch-1, color='r', linestyle='--', label=f'Epoch {epoch}')
+        plt.title('Loss Over Time')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(vis_dir, f'loss_curves_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 2. Binary classification metrics
+        plt.figure(figsize=(12, 6))
+        plt.plot(history['train_precision'], label='Train Precision')
+        plt.plot(history['train_recall'], label='Train Recall')
+        plt.plot(history['train_f1'], label='Train F1')
+        plt.plot(history['val_precision'], label='Val Precision')
+        plt.plot(history['val_recall'], label='Val Recall')
+        plt.plot(history['val_f1'], label='Val F1')
+        plt.axvline(x=epoch-1, color='r', linestyle='--', label=f'Epoch {epoch}')
+        plt.title('Binary Classification Metrics Over Time')
+        plt.xlabel('Epochs')
+        plt.ylabel('Score')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(vis_dir, f'binary_metrics_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 3. Regression metrics
+        plt.figure(figsize=(12, 6))
+        plt.plot(history['train_mae'], label='Train MAE')
+        plt.plot(history['train_rmse'], label='Train RMSE')
+        plt.plot(history['val_mae'], label='Val MAE')
+        plt.plot(history['val_rmse'], label='Val RMSE')
+        plt.axvline(x=epoch-1, color='r', linestyle='--', label=f'Epoch {epoch}')
+        plt.title('Regression Metrics Over Time')
+        plt.xlabel('Epochs')
+        plt.ylabel('Error')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(vis_dir, f'regression_metrics_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 4. Combined separate model losses
+        plt.figure(figsize=(12, 6))
+        plt.plot(history['train_classifier_loss'], label='Classifier Loss')
+        plt.plot(history['train_low_loss'], label='Low Regressor Loss')
+        plt.plot(history['train_high_loss'], label='High Regressor Loss')
+        plt.axvline(x=epoch-1, color='r', linestyle='--', label=f'Epoch {epoch}')
+        plt.title('Individual Model Losses')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(vis_dir, f'component_losses_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Visualizations saved to {vis_dir}")
     
     def _save_history(self, history):
         """Save the training history"""

@@ -62,19 +62,14 @@ class DepressionEnsemble(nn.Module):
                 - depression_probability: Probability of clinical depression (PHQ-8 >= 10)
                 - model_used: Indicator of which regressor was used (0=low, 1=high)
         """
-        start_time = time.time()
         batch_size, seq_len, feat_dim = x.shape
-        print(f"\nEnsemble forward pass: Input shape = {x.shape}")
         
         # First run binary classifier to determine depression probability
-        print("Running binary classifier...")
-        classifier_start = time.time()
         with torch.amp.autocast(device_type='cuda', enabled=True):
             depression_logit = self.binary_classifier(x)
             
             # Check for NaN or Inf values in logits
             if torch.isnan(depression_logit).any() or torch.isinf(depression_logit).any():
-                print("WARNING: NaN or Inf values detected in logits. Replacing with zeros.")
                 depression_logit = torch.nan_to_num(depression_logit, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Apply sigmoid and clamp to valid range [0,1]
@@ -83,13 +78,11 @@ class DepressionEnsemble(nn.Module):
             
             # Clear memory
             torch.cuda.empty_cache()
-            print(f"✓ Binary classifier complete ({time.time() - classifier_start:.2f}s)")
             
             # Create a consistent output shape for all tensors
             combined_scores = torch.zeros_like(depression_prob)
             
             # Convert masks to proper shapes for indexing
-            print("Creating masks for low/high range processing...")
             # Reshape to [batch_size] for proper batch-dimension indexing
             high_mask_flat = (depression_prob >= self.confidence_threshold).view(-1)
             low_mask_flat = ~high_mask_flat
@@ -98,14 +91,9 @@ class DepressionEnsemble(nn.Module):
             high_mask = (depression_prob >= self.confidence_threshold)
             low_mask = ~high_mask
             
-            print(f"High range samples: {high_mask_flat.sum().item()}/{batch_size}")
-            print(f"Low range samples: {low_mask_flat.sum().item()}/{batch_size}")
-            
             # Process samples by group (low/high)
             # Only process if we have samples in that category
             if low_mask_flat.any():
-                print("Processing low range samples...")
-                low_start = time.time()
                 # Extract samples with low scores using the flat mask
                 low_inputs = x[low_mask_flat]
                 
@@ -113,10 +101,8 @@ class DepressionEnsemble(nn.Module):
                 if len(low_inputs.shape) == 2:
                     low_inputs = low_inputs.unsqueeze(0)
                 
-                print(f"  Low inputs shape: {low_inputs.shape}")
                 # Get predictions
                 low_score = self.low_regressor(low_inputs)
-                print(f"  Low score shape: {low_score.shape}")
                 
                 # Assign to combined scores - reshape low_score to match combined_scores[low_mask]
                 combined_scores[low_mask] = low_score.view(-1)
@@ -124,11 +110,8 @@ class DepressionEnsemble(nn.Module):
                 # Clean up
                 del low_inputs, low_score
                 torch.cuda.empty_cache()
-                print(f"✓ Low range processing complete ({time.time() - low_start:.2f}s)")
             
             if high_mask_flat.any():
-                print("Processing high range samples...")
-                high_start = time.time()
                 # Extract samples with high scores using the flat mask
                 high_inputs = x[high_mask_flat]
                 
@@ -136,11 +119,8 @@ class DepressionEnsemble(nn.Module):
                 if len(high_inputs.shape) == 2:
                     high_inputs = high_inputs.unsqueeze(0)
                 
-                print(f"  High inputs shape: {high_inputs.shape}")
                 # Get predictions
                 high_score = self.high_regressor(high_inputs)
-                print(f"  High score shape: {high_score.shape}")
-                print(f"  combined_scores[high_mask] shape: {combined_scores[high_mask].shape}")
                 
                 # Fix: Reshape high_score to match the shape of combined_scores[high_mask]
                 # The diagnostic info shows high_score is [8, 1] but we need [8]
@@ -149,19 +129,15 @@ class DepressionEnsemble(nn.Module):
                 # Clean up
                 del high_inputs, high_score
                 torch.cuda.empty_cache()
-                print(f"✓ High range processing complete ({time.time() - high_start:.2f}s)")
             
             # Create mask for binary classification (1=high range, 0=low range)
             high_range_mask = (depression_prob >= self.confidence_threshold).float()
-            print(f"Ensemble forward pass complete ({time.time() - start_time:.2f}s)")
             
             # Safety check for NaN/Inf values in outputs
             if torch.isnan(combined_scores).any() or torch.isinf(combined_scores).any():
-                print("WARNING: NaN or Inf values detected in final scores. Replacing with zeros.")
                 combined_scores = torch.nan_to_num(combined_scores, nan=0.0, posinf=0.0, neginf=0.0)
             
             if torch.isnan(depression_prob).any() or torch.isinf(depression_prob).any():
-                print("WARNING: NaN or Inf values detected in probabilities. Clamping to [0,1].")
                 depression_prob = torch.nan_to_num(depression_prob, nan=0.5, posinf=1.0, neginf=0.0)
                 depression_prob = torch.clamp(depression_prob, min=0.0, max=1.0)
         
