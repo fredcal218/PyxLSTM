@@ -32,12 +32,12 @@ def main():
     patience = 5  
     
     # Reduce batch size for ensemble training to prevent OOM
-    batch_size = 16
+    batch_size = 8
     
     learning_rate = 0.0001
-    hidden_size = 256  
+    hidden_size = 128  
     num_layers = 2
-    dropout = 0.5
+    dropout = 0.4
     
     # Use smaller sequence length for ensemble to avoid OOM
     ensemble_seq_length = 900  

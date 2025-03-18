@@ -533,7 +533,8 @@ class EnsembleTrainer:
         vis_dir = os.path.join(self.save_dir, 'visualizations')
         os.makedirs(vis_dir, exist_ok=True)
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Remove timestamp to avoid piling up visualizations
+        # Each new best model will overwrite previous visualizations
         
         # 1. Loss curves
         plt.figure(figsize=(12, 6))
@@ -545,7 +546,7 @@ class EnsembleTrainer:
         plt.ylabel('Loss')
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(vis_dir, f'loss_curves_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(vis_dir, 'loss_curves.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
         # 2. Binary classification metrics
@@ -562,7 +563,7 @@ class EnsembleTrainer:
         plt.ylabel('Score')
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(vis_dir, f'binary_metrics_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(vis_dir, 'binary_metrics.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
         # 3. Regression metrics
@@ -577,7 +578,7 @@ class EnsembleTrainer:
         plt.ylabel('Error')
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(vis_dir, f'regression_metrics_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(vis_dir, 'regression_metrics.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
         # 4. Combined separate model losses
@@ -591,10 +592,10 @@ class EnsembleTrainer:
         plt.ylabel('Loss')
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join(vis_dir, f'component_losses_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(vis_dir, 'component_losses.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"Visualizations saved to {vis_dir}")
+        print(f"Visualizations updated in {vis_dir}")
     
     def _save_history(self, history):
         """Save the training history"""
