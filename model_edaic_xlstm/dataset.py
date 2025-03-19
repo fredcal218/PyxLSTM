@@ -91,9 +91,31 @@ class EDAICDataset(Dataset):
         
         # Load data
         try:
+            # Read the full CSV first to apply confidence filtering
             df = pd.read_csv(file_path)
             
-            # Sample only 1/n of the frames
+            # Find the confidence column - OpenFace typically has a "confidence" column
+            # or a column containing face detection confidence
+            confidence_col = None
+            for col in df.columns:
+                if 'confidence' in col.lower() and not col.endswith('_c'):
+                    confidence_col = col
+                    break
+            
+            # If confidence column is found, filter rows
+            if confidence_col:
+                # Filter rows where confidence is at least 0.90
+                original_len = len(df)
+                df = df[df[confidence_col] >= 0.90].reset_index(drop=True)
+                filtered_len = len(df)
+                
+                if len(self.samples) == 0:  # Print info for first participant only
+                    print(f"  - Applied confidence filter (>= 0.90): {original_len} → {filtered_len} frames "
+                          f"({filtered_len/original_len*100:.1f}% retained)")
+            else:
+                print(f"Warning: No confidence column found for participant {participant_id}, using all frames")
+            
+            # Now apply frame_step sampling after confidence filtering
             df = df.iloc[::self.frame_step].reset_index(drop=True)
             
             # Use adaptive sequence length
@@ -125,7 +147,7 @@ class EDAICDataset(Dataset):
                 print(f"  - Pose/gaze features: {len(pose_gaze_cols)}")
                 print(f"  - AU intensity features: {len(au_intensity_cols)}")
                 print(f"  - Excluded AU confidence features: {len([c for c in df.columns if 'AU' in c and c.endswith('_c')])}")
-                print(f"  - Original frame count: {len(df) * self.frame_step} → Downsampled: {len(df)}")
+                print(f"  - Original frame count after confidence filtering: {len(df) * self.frame_step} → Downsampled: {len(df)}")
                 print(f"  - Using adaptive stride: Minimal/Mild={self.stride}, Moderate={self.stride//2}, "
                       f"Mod.Severe={self.stride//3}, Severe={self.stride//5}")
 
