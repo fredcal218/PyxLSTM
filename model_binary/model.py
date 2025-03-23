@@ -205,7 +205,7 @@ class DepBinaryClassifier(nn.Module):
             target_class (int): Target class (1=depressed, 0=not depressed)
             
         Returns:
-            numpy.ndarray: Importance scores for each input feature
+            dict: Importance scores for each input feature
         """
         # Set model to eval mode
         self.eval()
@@ -213,27 +213,30 @@ class DepBinaryClassifier(nn.Module):
         
         # Forward pass
         logits = self(x_input)
-        probs = torch.sigmoid(logits)  # Convert to probabilities
         
-        # For binary classification:
-        # - For target_class=1, we want to maximize the output (depression)
-        # - For target_class=0, we want to minimize the output (no depression)
+        # Select target based on class - use logits directly
         if target_class == 1:
-            # Maximize prediction probability
-            loss = -torch.log(probs).sum()
+            # For positive class: maximize logits (equivalent to minimizing -logits)
+            target = logits  # We want to maximize this
         else:
-            # Minimize prediction probability
-            loss = -torch.log(1 - probs).sum()
+            # For negative class: minimize logits (equivalent to maximizing -logits)
+            target = -logits  # We want to maximize this (same as minimizing logits)
         
-        # Backward pass
-        loss.backward()
-        
-        # Get gradients
-        gradients = x_input.grad.detach()
+        # Compute gradients w.r.t inputs
+        gradients = torch.autograd.grad(
+            outputs=target.sum(),
+            inputs=x_input,
+            create_graph=False,
+            retain_graph=False
+        )[0]
         
         # Feature importance is the mean absolute gradient per feature
         # Average over batch and sequence dimensions
-        feature_importance = torch.mean(torch.abs(gradients), dim=(0, 1)).cpu().numpy()
+        feature_importance = torch.mean(torch.abs(gradients), dim=(0, 1)).detach().cpu().numpy()
+        
+        # Normalize importance scores
+        if np.sum(feature_importance) > 0:
+            feature_importance = feature_importance / np.sum(feature_importance)
         
         # Store feature importance
         if 'global' not in self.feature_importances:
@@ -260,54 +263,64 @@ class DepBinaryClassifier(nn.Module):
             target_class (int): Target class (1=depressed, 0=not depressed)
             
         Returns:
-            numpy.ndarray: Importance scores for each feature
+            dict: Importance scores for each feature
         """
-        # Set model to eval mode
+        # Set model to eval mode and ensure we're working with PyTorch tensors
         self.eval()
+        x = x.detach()
         
         # Create baseline if not provided (zeros)
         if baseline is None:
             baseline = torch.zeros_like(x)
         
+        # Debug print
+        print(f"Input shape: {x.shape}, Range: [{x.min().item():.4f}, {x.max().item():.4f}]")
+        
         # Scale inputs along path from baseline to input
         scaled_inputs = [baseline + (float(i) / steps) * (x - baseline) for i in range(steps + 1)]
         
-        # Initialize gradients
-        grads = []
-        for scaled_input in scaled_inputs:
-            # Enable gradient calculation
-            scaled_input.requires_grad_(True)
+        # Calculate gradients at each step
+        total_gradients = torch.zeros_like(x)
+        
+        for i, scaled_input in enumerate(scaled_inputs):
+            scaled_input = scaled_input.clone().detach().requires_grad_(True)
             
             # Forward pass
             logits = self(scaled_input)
-            probs = torch.sigmoid(logits)  # Convert to probabilities
             
-            # Select output based on target class
+            # Determine target based on class
             if target_class == 1:
-                target_output = probs
+                target = logits  # We want positive logits for "depressed" class
             else:
-                target_output = 1 - probs
+                target = -logits  # We want negative logits for "not depressed" class
             
-            # Backprop
-            torch.autograd.backward(target_output, 
-                                   torch.ones_like(target_output),
-                                   retain_graph=False)
+            # Compute gradients for this step
+            grad = torch.autograd.grad(
+                outputs=target.sum(),
+                inputs=scaled_input,
+                create_graph=False,
+                retain_graph=False
+            )[0]
             
-            # Get gradients
-            grad = scaled_input.grad.detach()
-            grads.append(grad)
+            # Accumulate gradients
+            total_gradients += grad.detach()
             
-            # Clear gradients for next step
-            scaled_input.grad.zero_()
+            # Debug every 10 steps
+            if i % 10 == 0:
+                print(f"Step {i}/{steps}: Grad range [{grad.min().item():.4f}, {grad.max().item():.4f}]")
         
-        # Calculate average gradients
-        avg_grads = torch.mean(torch.stack(grads), dim=0)
+        # Average the gradients
+        avg_gradients = total_gradients / (steps + 1)
         
-        # Calculate integrated gradients
-        ig = (x - baseline) * avg_grads
+        # Element-wise multiply average gradients with the input-baseline difference
+        attributions = (x - baseline) * avg_gradients
         
-        # Sum over sequence dimension
-        feature_importance = torch.mean(torch.abs(ig), dim=(0, 1)).cpu().numpy()
+        # Sum over batch and sequence dimensions
+        feature_importance = torch.mean(torch.abs(attributions), dim=(0, 1)).cpu().numpy()
+        
+        # Normalize if possible
+        if np.sum(feature_importance) > 0:
+            feature_importance = feature_importance / np.sum(feature_importance)
         
         # Store in feature importances
         if 'global' not in self.feature_importances:
@@ -315,11 +328,19 @@ class DepBinaryClassifier(nn.Module):
         
         self.feature_importances['global']['integrated_gradients'] = feature_importance
         
+        # Debug print overall importance results
+        print(f"Feature importance range: [{feature_importance.min():.6f}, {feature_importance.max():.6f}]")
+        print(f"Sum of importance: {np.sum(feature_importance):.6f}")
+        
         # Map to feature names
         importance_dict = {
             self.feature_names[i]: feature_importance[i] 
             for i in range(min(len(self.feature_names), len(feature_importance)))
         }
+        
+        # Debug print top features
+        top_features = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:5]
+        print("Top 5 features:", top_features)
         
         return importance_dict
     
@@ -340,6 +361,7 @@ class DepBinaryClassifier(nn.Module):
             pred_class = 1 if prob.item() > 0.5 else 0
         
         # Calculate feature importance for predicted class
+        print(f"Instance prediction: class={pred_class}, probability={prob.item():.4f}")
         importance = self.integrated_gradients(x, target_class=pred_class)
         
         # Store instance importance
@@ -376,11 +398,17 @@ class DepBinaryClassifier(nn.Module):
         if importance_dict is None:
             if self.feature_importances is None or 'global' not in self.feature_importances:
                 raise ValueError("No feature importance data available")
-            # Use gradient-based by default if available
-            if 'gradient_based' in self.feature_importances['global']:
+            
+            # Use integrated gradients by default if available
+            if 'integrated_gradients' in self.feature_importances['global']:
+                importance_array = self.feature_importances['global']['integrated_gradients']
+            elif 'gradient_based' in self.feature_importances['global']:
                 importance_array = self.feature_importances['global']['gradient_based']
             else:
                 importance_array = next(iter(self.feature_importances['global'].values()))
+            
+            # Debug print importance array stats
+            print(f"Importance array: min={importance_array.min():.6f}, max={importance_array.max():.6f}, mean={importance_array.mean():.6f}")
             
             importance_dict = {
                 self.feature_names[i]: importance_array[i]

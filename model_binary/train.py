@@ -1,5 +1,5 @@
 import os
-import random  # Add random module import
+import random  
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,6 +11,7 @@ import seaborn as sns
 from tqdm import tqdm
 import time
 from datetime import datetime
+import json
 
 from model import DepBinaryClassifier
 from data_processor import get_dataloaders
@@ -216,9 +217,37 @@ def train():
         if val_metrics['f1'] > best_val_f1:
             best_val_f1 = val_metrics['f1']
             patience_counter = 0
+            
             # Save best model
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best_model.pt"))
-            print(f"  Model improved! Saved checkpoint.")
+            model_path = os.path.join(OUTPUT_DIR, "best_model.pt")
+            torch.save(model.state_dict(), model_path)
+            
+            # Save metrics as JSON
+            metrics_json = {
+                'epoch': epoch + 1,
+                'train_metrics': {
+                    'loss': train_loss,
+                    'accuracy': train_metrics['accuracy'],
+                    'precision': train_metrics['precision'],
+                    'recall': train_metrics['recall'],
+                    'f1': train_metrics['f1']
+                },
+                'validation_metrics': {
+                    'loss': val_loss,
+                    'accuracy': val_metrics['accuracy'],
+                    'precision': val_metrics['precision'],
+                    'recall': val_metrics['recall'],
+                    'f1': val_metrics['f1']
+                },
+                'hyperparameters': config
+            }
+            
+            # Save metrics to JSON file
+            metrics_path = os.path.join(OUTPUT_DIR, "best_model_metrics.json")
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics_json, f, indent=4)
+            
+            print(f"  Model improved! Saved checkpoint and metrics to {metrics_path}")
         else:
             patience_counter += 1
             print(f"  No improvement. Patience: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
@@ -414,16 +443,30 @@ def analyze_feature_importance(model, test_loader):
     # Get a batch of test data
     batch = next(iter(test_loader))
     features = batch['features'].to(device)
+    labels = batch['binary_label'].to(device)
     
     print("Analyzing feature importance...")
+    print(f"Feature batch shape: {features.shape}")
+    print(f"Feature values range: [{features.min().item():.4f}, {features.max().item():.4f}]")
     
     # Get model's attention weights
-    model.get_attention_weights()
+    attention_weights = model.get_attention_weights()
+    print(f"Retrieved {len(attention_weights)} attention weight tensors")
+    
+    # To debug gradient flow, use a single example first
+    single_example = features[0:1]  # Just the first example in batch
+    print(f"Using single example of shape {single_example.shape} for initial analysis")
     
     # Calculate global feature importance using integrated gradients
-    importance_dict = model.integrated_gradients(features)
+    print("Calculating integrated gradients (this may take a moment)...")
+    importance_dict = model.integrated_gradients(single_example, steps=20)  # Fewer steps for debugging
+    
+    # Print importance stats
+    importance_values = list(importance_dict.values())
+    print(f"Feature importance stats: min={min(importance_values):.6f}, max={max(importance_values):.6f}")
     
     # Visualize global feature importance
+    print("Visualizing feature importance...")
     model.visualize_feature_importance(
         importance_dict=importance_dict,
         top_k=20,
@@ -431,8 +474,24 @@ def analyze_feature_importance(model, test_loader):
         title="Global Feature Importance for Depression Detection"
     )
     
+    # Try gradient-based method too for comparison
+    print("Calculating gradient-based importance...")
+    grad_importance = model.gradient_feature_importance(single_example)
+    model.visualize_feature_importance(
+        importance_dict=grad_importance,
+        top_k=20,
+        save_path=os.path.join(OUTPUT_DIR, "gradient_based_importance.png"),
+        title="Gradient-Based Feature Importance"
+    )
+    
     # Extract and visualize importance of clinically significant AUs
+    print("Analyzing clinical AU importance...")
     clinical_importance = model.get_clinical_au_importance()
+    
+    # Print clinical importance values
+    print("Clinical AU Importance:")
+    for au, importance in clinical_importance.items():
+        print(f"  {au}: {importance:.6f}")
     
     # Plot clinical AUs importance
     plt.figure(figsize=(10, 6))

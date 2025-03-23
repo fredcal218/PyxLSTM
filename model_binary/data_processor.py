@@ -8,7 +8,7 @@ class EDAICDataset(Dataset):
     """
     Dataset class for E-DAIC depression binary classification
     """
-    def __init__(self, data_dir, labels_path, split='train', max_seq_length=150):
+    def __init__(self, data_dir, labels_path, split='train', max_seq_length=150, confidence_threshold=0.9):
         """
         Initialize E-DAIC dataset
         
@@ -17,10 +17,12 @@ class EDAICDataset(Dataset):
             labels_path (str): Path to labels CSV file
             split (str): Dataset split ('train', 'dev', or 'test')
             max_seq_length (int): Maximum sequence length to use
+            confidence_threshold (float): Minimum confidence value to include a frame
         """
         self.data_dir = data_dir
         self.max_seq_length = max_seq_length
         self.split = split
+        self.confidence_threshold = confidence_threshold
         
         # Load labels
         self.labels_df = pd.read_csv(labels_path)
@@ -53,8 +55,17 @@ class EDAICDataset(Dataset):
         # Extract feature names (used for interpretability)
         if len(self.feature_files) > 0:
             sample_df = pd.read_csv(self.feature_files[0])
-            self.feature_names = [col for col in sample_df.columns 
-                                if not col.startswith('timestamp') and not col.endswith('_c')]
+            
+            # Get only pose, gaze, and AU features (excluding confidence columns)
+            self.feature_names = []
+            
+            for col in sample_df.columns:
+                # Include pose and gaze features
+                if col.startswith('pose_') or col.startswith('gaze_'):
+                    self.feature_names.append(col)
+                # Include AU intensity features but exclude confidence
+                elif col.startswith('AU') and not col.endswith('_c'):
+                    self.feature_names.append(col)
         else:
             self.feature_names = []
             print(f"Warning: No feature files found for {split} split")
@@ -69,10 +80,17 @@ class EDAICDataset(Dataset):
         # Load features
         df = pd.read_csv(feature_path)
         
-        # Extract relevant features (drop timestamp and confidence columns)
-        feature_cols = [col for col in df.columns 
-                       if not col.startswith('timestamp') and not col.endswith('_c')]
-        features = df[feature_cols].values
+        # Apply confidence filtering
+        high_confidence_mask = df['confidence'] >= self.confidence_threshold
+        
+        # Filter frames with high confidence only
+        if sum(high_confidence_mask) > 0:
+            df = df[high_confidence_mask].reset_index(drop=True)
+        else:
+            print(f"Warning: No frames with confidence >= {self.confidence_threshold} for {pid}. Using all frames.")
+        
+        # Extract relevant features (pose, gaze, and AUs)
+        features = df[self.feature_names].values
         
         # Handle sequence length
         if features.shape[0] > self.max_seq_length:
@@ -90,7 +108,7 @@ class EDAICDataset(Dataset):
             'features': torch.FloatTensor(features),
             'binary_label': torch.FloatTensor([binary_label]),
             'participant_id': pid,
-            'seq_length': min(df.shape[0], self.max_seq_length)
+            'seq_length': min(features.shape[0], self.max_seq_length)
         }
         
         # Add PHQ score if available (for reference only)
@@ -115,7 +133,7 @@ class EDAICDataset(Dataset):
             'total': len(self.valid_participants)
         }
 
-def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150):
+def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, confidence_threshold=0.9):
     """
     Create data loaders for train, dev, and test sets
     
@@ -124,6 +142,7 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150):
         labels_dir (str): Directory containing label files
         batch_size (int): Batch size for dataloaders
         max_seq_length (int): Maximum sequence length
+        confidence_threshold (float): Minimum confidence for face detection
         
     Returns:
         dict: Dictionary of dataloaders and datasets for train, dev, and test sets
@@ -133,21 +152,24 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150):
         data_dir=data_dir,
         labels_path=os.path.join(labels_dir, "train_split.csv"),
         split='train',
-        max_seq_length=max_seq_length
+        max_seq_length=max_seq_length,
+        confidence_threshold=confidence_threshold
     )
     
     dev_dataset = EDAICDataset(
         data_dir=data_dir,
         labels_path=os.path.join(labels_dir, "dev_split.csv"),
         split='dev',
-        max_seq_length=max_seq_length
+        max_seq_length=max_seq_length,
+        confidence_threshold=confidence_threshold
     )
     
     test_dataset = EDAICDataset(
         data_dir=data_dir,
         labels_path=os.path.join(labels_dir, "test_split.csv"),
         split='test',
-        max_seq_length=max_seq_length
+        max_seq_length=max_seq_length,
+        confidence_threshold=confidence_threshold
     )
     
     # Print dataset statistics
