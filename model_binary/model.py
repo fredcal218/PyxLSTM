@@ -569,11 +569,25 @@ class DepBinaryClassifier(nn.Module):
         
         # Highlight AUs of interest
         highlighted_aus = ['AU01', 'AU04', 'AU05', 'AU06', 'AU07', 'AU12', 'AU15']
+        has_highlighted = False
+        
         for i, feature in enumerate(feature_names):
             for au in highlighted_aus:
                 if au in feature:
                     bars[i].set_color('red')
+                    has_highlighted = True
                     break
+        
+        # Add legend to explain colors
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='red', label='Clinically Significant AUs'),
+            Patch(facecolor='cornflowerblue', label='Other Features')
+        ]
+        
+        # Only show legend if we have at least one highlighted AU
+        if has_highlighted:
+            plt.legend(handles=legend_elements, loc='upper right')
         
         plt.tight_layout()
         

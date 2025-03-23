@@ -4,13 +4,14 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
+from movement_analysis import MovementFeatureExtractor
 
 class EDAICDataset(Dataset):
     """
     Dataset class for E-DAIC depression binary classification
     """
     def __init__(self, data_dir, labels_path, split='train', max_seq_length=150, confidence_threshold=0.9, 
-                feature_scalers=None, is_train=False):
+                feature_scalers=None, is_train=False, include_movement_features=True):
         """
         Initialize E-DAIC dataset
         
@@ -22,6 +23,7 @@ class EDAICDataset(Dataset):
             confidence_threshold (float): Minimum confidence value to include a frame
             feature_scalers (dict): Dictionary of feature scalers for normalization
             is_train (bool): Whether this is the training set (for fitting scalers)
+            include_movement_features (bool): Whether to include derived movement features
         """
         self.data_dir = data_dir
         self.max_seq_length = max_seq_length
@@ -29,6 +31,11 @@ class EDAICDataset(Dataset):
         self.confidence_threshold = confidence_threshold
         self.feature_scalers = feature_scalers
         self.is_train = is_train
+        self.include_movement_features = include_movement_features
+        
+        # Initialize movement feature extractor
+        if include_movement_features:
+            self.movement_extractor = MovementFeatureExtractor()
         
         # Load labels
         self.labels_df = pd.read_csv(labels_path)
@@ -72,7 +79,15 @@ class EDAICDataset(Dataset):
                 # Include AU intensity features but exclude confidence
                 elif col.startswith('AU') and not col.endswith('_c'):
                     self.feature_names.append(col)
-                    
+            
+            # If including movement features, extract them from a sample and add their names
+            if self.include_movement_features:
+                sample_with_movement = self.movement_extractor.extract_movement_features(
+                    sample_df[self.feature_names].head(100))  # Use just head for efficiency
+                movement_features = [col for col in sample_with_movement.columns 
+                                    if col not in self.feature_names]
+                self.feature_names.extend(movement_features)
+                
             # Initialize feature scalers if we're the training set and no scalers provided
             if is_train and feature_scalers is None:
                 self.feature_scalers = {feature: StandardScaler() for feature in self.feature_names}
@@ -101,8 +116,17 @@ class EDAICDataset(Dataset):
         else:
             print(f"Warning: No frames with confidence >= {self.confidence_threshold} for {pid}. Using all frames.")
         
-        # Extract relevant features (pose, gaze, and AUs)
-        features_df = df[self.feature_names]
+        # Extract basic features (pose, gaze, AUs)
+        base_features = [col for col in self.feature_names if col in df.columns]
+        features_df = df[base_features].copy()
+        
+        # Add movement features if requested
+        if self.include_movement_features:
+            features_df = self.movement_extractor.extract_movement_features(features_df)
+            
+            # Make sure to only use features that were defined in feature_names
+            # This ensures consistency across all participants
+            features_df = features_df[self.feature_names]
         
         # Normalize features if scalers are available
         if self.feature_scalers:
@@ -110,15 +134,16 @@ class EDAICDataset(Dataset):
             
             # Apply scaling for each feature separately
             for feature in self.feature_names:
-                feature_values = features_df[feature].values.reshape(-1, 1)
-                
-                # Fit scaler if this is training set, otherwise just transform
-                if self.is_train:
-                    normalized_values = self.feature_scalers[feature].fit_transform(feature_values)
-                else:
-                    normalized_values = self.feature_scalers[feature].transform(feature_values)
+                if feature in features_df.columns:
+                    feature_values = features_df[feature].values.reshape(-1, 1)
                     
-                normalized_features[feature] = normalized_values.flatten()
+                    # Fit scaler if this is training set, otherwise just transform
+                    if self.is_train:
+                        normalized_values = self.feature_scalers[feature].fit_transform(feature_values)
+                    else:
+                        normalized_values = self.feature_scalers[feature].transform(feature_values)
+                        
+                    normalized_features[feature] = normalized_values.flatten()
             
             features = normalized_features.values
         else:
@@ -169,7 +194,8 @@ class EDAICDataset(Dataset):
         """Get fitted feature scalers for transfer to other datasets"""
         return self.feature_scalers
 
-def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, confidence_threshold=0.9):
+def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, 
+                  confidence_threshold=0.9, include_movement_features=True):
     """
     Create data loaders for train, dev, and test sets
     
@@ -179,6 +205,7 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
         batch_size (int): Batch size for dataloaders
         max_seq_length (int): Maximum sequence length
         confidence_threshold (float): Minimum confidence for face detection
+        include_movement_features (bool): Whether to include derived movement features
         
     Returns:
         dict: Dictionary of dataloaders and datasets for train, dev, and test sets
@@ -191,7 +218,8 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
         max_seq_length=max_seq_length,
         confidence_threshold=confidence_threshold,
         feature_scalers=None,  # Will initialize new scalers
-        is_train=True  # Will fit the scalers
+        is_train=True,  # Will fit the scalers
+        include_movement_features=include_movement_features
     )
     
     # Pre-fit the scalers on all training data
@@ -229,7 +257,8 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
         max_seq_length=max_seq_length,
         confidence_threshold=confidence_threshold,
         feature_scalers=feature_scalers,
-        is_train=False  # Don't refit, just transform
+        is_train=False,  # Don't refit, just transform
+        include_movement_features=include_movement_features
     )
     
     dev_dataset = EDAICDataset(
@@ -239,7 +268,8 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
         max_seq_length=max_seq_length,
         confidence_threshold=confidence_threshold,
         feature_scalers=feature_scalers,
-        is_train=False
+        is_train=False,
+        include_movement_features=include_movement_features
     )
     
     test_dataset = EDAICDataset(
@@ -249,7 +279,8 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
         max_seq_length=max_seq_length,
         confidence_threshold=confidence_threshold,
         feature_scalers=feature_scalers,
-        is_train=False
+        is_train=False,
+        include_movement_features=include_movement_features
     )
     
     # Print dataset statistics

@@ -40,14 +40,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Hyperparameters
-BATCH_SIZE = 16
+BATCH_SIZE = 24
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2
 DROPOUT = 0.3
-MAX_SEQ_LENGTH = 250
+MAX_SEQ_LENGTH = 450
 LEARNING_RATE = 0.0005
 NUM_EPOCHS = 50
-EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_PATIENCE = 15
 
 # Directories
 DATA_DIR = "E-DAIC/data_extr"
@@ -377,6 +377,24 @@ def evaluate_model(model, test_loader):
     print(f"  F1 Score (Depressed): {report['Depressed']['f1-score']:.4f}")
     print(f"  ROC AUC: {auc:.4f}")
     
+    # Create test metrics JSON
+    test_metrics = {
+        'accuracy': report['accuracy'],
+        'precision_depressed': report['Depressed']['precision'],
+        'recall_depressed': report['Depressed']['recall'],
+        'f1_depressed': report['Depressed']['f1-score'],
+        'roc_auc': auc,
+        'confusion_matrix': cm.tolist(),
+        'classification_report': report
+    }
+    
+    # Save test metrics to JSON file
+    metrics_path = os.path.join(OUTPUT_DIR, "test_metrics.json")
+    with open(metrics_path, 'w') as f:
+        json.dump(test_metrics, f, indent=4)
+    
+    print(f"  Test metrics saved to: {metrics_path}")
+    
     # Prepare results DataFrame with both logits and probabilities
     results_dict = {
         'Participant_ID': all_participant_ids,
@@ -607,7 +625,9 @@ def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep
     plt.yticks(x, all_features)
     plt.xlabel('Feature Importance')
     plt.title('Feature Importance Comparison: Depressed vs. Non-depressed')
-    plt.legend()
+    
+    # Enhance legend with more descriptive labels
+    plt.legend(loc='lower right', title='Participant Status')
     
     plt.tight_layout()
     if save_path:
