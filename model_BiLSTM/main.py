@@ -133,6 +133,12 @@ def main():
     
     print(f"Hyperparameters saved to {hyperparams_path}")
     
+    # Add command to specify start fold (default is 1)
+    start_fold = 1  # Start from fold 2 since fold 1 is already trained
+    end_fold = 5    # Process up to fold 5 (can be adjusted as needed)
+    
+    print(f"Training folds {start_fold} through {end_fold}")
+    
     # Create cross-validation trainer
     cv_trainer = CrossValidationTrainer(
         model_class=BiLSTM_Attention,
@@ -144,18 +150,20 @@ def main():
     
     # Define parameter grid with more stable learning rates
     param_grid = {
-        'hidden_size': [32, 64, 128],
+        'hidden_size': [32, 64],
         'num_layers': [2, 3],
-        'dropout': [0.2, 0.3, 0.4],
-        'learning_rate': [0.001, 0.005, 0.01]  # Lower learning rates to avoid NaN issues
+        'dropout': [0.2, 0.3],
+        'learning_rate': [0.1, 0.01]  
     }
     
-    # Perform cross-validation
-    print("\nStarting nested cross-validation with hyperparameter tuning...")
+    # Perform cross-validation, specifying start_fold and end_fold
+    print(f"\nStarting nested cross-validation from fold {start_fold} to {end_fold}...")
     results = cv_trainer.perform_cross_validation(
         param_grid=param_grid,
         n_folds=5,
-        inner_folds=5
+        inner_folds=5,
+        start_fold=start_fold,
+        end_fold=end_fold
     )
     
     # Print final results

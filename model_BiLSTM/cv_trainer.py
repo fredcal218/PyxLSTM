@@ -41,6 +41,9 @@ class CrossValidationTrainer:
         self.save_dir = params.get('save_dir', 'checkpoints')
         os.makedirs(self.save_dir, exist_ok=True)
         
+        # Path for tracking progress
+        self.progress_path = os.path.join(self.save_dir, 'cv_progress.json')
+        
     def train_model(self, model, train_loader, criterion, optimizer, epochs, max_grad_norm=1.0):
         """
         Train a model for specified epochs with gradient clipping
@@ -168,7 +171,7 @@ class CrossValidationTrainer:
             'r2': r2
         }
     
-    def perform_cross_validation(self, param_grid=None, n_folds=5, inner_folds=5):
+    def perform_cross_validation(self, param_grid=None, n_folds=5, inner_folds=5, start_fold=1, end_fold=None):
         """
         Perform nested cross-validation with hyperparameter tuning.
         
@@ -176,6 +179,8 @@ class CrossValidationTrainer:
             param_grid: Dict of hyperparameter names and values to search
             n_folds: Number of outer folds for CV
             inner_folds: Number of inner folds for hyperparameter tuning
+            start_fold: Which fold to start from (1-indexed)
+            end_fold: Which fold to end on (1-indexed, None means all folds)
             
         Returns:
             Dict of cross-validation results
@@ -189,20 +194,52 @@ class CrossValidationTrainer:
                 'learning_rate': [0.01, 0.05, 0.1]  # Added intermediate value
             }
         
-        # Define outer cross-validation
+        # Set end_fold to n_folds if not specified
+        if end_fold is None:
+            end_fold = n_folds
+        
+        # Validate fold indices
+        if start_fold < 1 or start_fold > n_folds:
+            raise ValueError(f"start_fold must be between 1 and {n_folds}")
+        if end_fold < start_fold or end_fold > n_folds:
+            raise ValueError(f"end_fold must be between {start_fold} and {n_folds}")
+            
+        # Load existing progress if available
+        existing_progress = self._load_progress()
+        existing_results = existing_progress.get('outer_cv_results', [])
+        existing_models = existing_progress.get('best_models', [])
+        existing_params = existing_progress.get('best_params_per_fold', [])
+        
+        # Define outer cross-validation with fixed seed
         outer_cv = KFold(n_splits=n_folds, shuffle=True, random_state=42)
         
         # Get indices for all samples in combined dataset
         indices = list(range(len(self.combined_dataset)))
         
         # Store results
-        outer_results = []
-        best_models = []
-        best_params_per_fold = []
+        outer_results = existing_results.copy() if existing_results else []
+        best_models = existing_models.copy() if existing_models else []
+        best_params_per_fold = existing_params.copy() if existing_params else []
         
-        # Perform outer cross-validation
-        for fold, (train_idx, val_idx) in enumerate(outer_cv.split(indices)):
-            print(f"\nOuter Fold {fold+1}/{n_folds}")
+        # Create list of fold splits in advance to maintain consistency
+        fold_splits = list(outer_cv.split(indices))
+        
+        # Process only the requested folds
+        for fold, (fold_idx, (train_idx, val_idx)) in enumerate(zip(range(n_folds), fold_splits), 1):
+            # Skip folds that are out of the requested range
+            if fold < start_fold or fold > end_fold:
+                # If we don't have results for this fold yet but it's before start_fold,
+                # we need placeholder results
+                if fold < start_fold and fold > len(outer_results):
+                    print(f"Warning: No data for fold {fold} (before start_fold), skipping")
+                continue
+            
+            # Check if we already have results for this fold
+            if fold <= len(outer_results):
+                print(f"\nSkipping Fold {fold}/{n_folds} - Already processed")
+                continue
+                
+            print(f"\nProcessing Outer Fold {fold}/{n_folds}")
             
             # Create train and validation datasets for this fold
             outer_train_dataset = Subset(self.combined_dataset, train_idx)
@@ -233,7 +270,7 @@ class CrossValidationTrainer:
             optimizer = optim.Adam(model.parameters(), lr=best_params['learning_rate'])
             
             # Train model
-            print(f"Training final model for fold {fold+1} with best parameters")
+            print(f"Training final model for fold {fold} with best parameters")
             model, training_successful = self.train_model(
                 model, 
                 train_loader, 
@@ -248,35 +285,55 @@ class CrossValidationTrainer:
             print(f"Validation RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
             
             # Save model
-            model_path = os.path.join(self.save_dir, f"model_fold{fold+1}.pt")
+            model_path = os.path.join(self.save_dir, f"model_fold{fold}.pt")
             torch.save(model.state_dict(), model_path)
             best_models.append(model.state_dict())
             
             # Store results
             result = {
-                'fold': fold + 1,
+                'fold': fold,
                 'best_params': best_params,
                 'validation_metrics': val_metrics,
                 'training_successful': training_successful
             }
             outer_results.append(result)
+            
+            # Save progress after each fold
+            self._save_progress(outer_results, best_params_per_fold)
         
-        # Evaluate ensemble on test set
-        test_loader = DataLoader(
-            self.test_dataset, 
-            batch_size=self.params['batch_size']
-        )
+        # Only evaluate ensemble if we've processed all folds or specifically requested
+        final_evaluation = True
         
-        test_metrics = self._evaluate_ensemble(best_models, best_params_per_fold, test_loader)
+        # Check if we've processed all folds from 1 to n_folds
+        if len(outer_results) < n_folds and end_fold < n_folds:
+            print(f"\nNote: Not all folds processed yet ({len(outer_results)}/{n_folds}).")
+            print(f"Skipping final ensemble evaluation until all folds are complete.")
+            print(f"You can resume training with start_fold={len(outer_results)+1} later.")
+            final_evaluation = False
+            
+        # Skip ensemble evaluation if we haven't processed enough folds
+        test_metrics = {}
+        if final_evaluation:
+            # Evaluate ensemble on test set
+            test_loader = DataLoader(
+                self.test_dataset, 
+                batch_size=self.params['batch_size']
+            )
+            
+            test_metrics = self._evaluate_ensemble(best_models, best_params_per_fold, test_loader)
         
         # Prepare results dictionary
         results = {
             'outer_cv_results': outer_results,
             'best_params_per_fold': best_params_per_fold,
-            'test_metrics': test_metrics
+            'folds_completed': len(outer_results),
+            'total_folds': n_folds
         }
         
-        # Save results
+        if final_evaluation:
+            results['test_metrics'] = test_metrics
+        
+        # Save results (will overwrite progress file with final results)
         self._save_results(results)
         
         return results
@@ -501,6 +558,77 @@ class CrossValidationTrainer:
             
         return combinations
     
+    def _save_progress(self, outer_results, best_params_per_fold):
+        """Save progress to a temporary file after each fold"""
+        # Create dictionary with current progress
+        progress = {
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'outer_cv_results': outer_results,
+            'best_params_per_fold': best_params_per_fold,
+            'folds_completed': len(outer_results),
+            'parameters': {
+                k: v for k, v in self.params.items() 
+                if k not in ('model_class', 'train_dataset', 'val_dataset', 'test_dataset')
+            }
+        }
+        
+        # Make JSON serializable with improved type checking
+        def make_serializable(obj):
+            if isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [make_serializable(item) for item in obj]
+            elif isinstance(obj, (np.float32, np.float64, float)):
+                # Only check for NaN on floating point types
+                if np.isnan(obj):
+                    return "NaN"
+                return float(obj)
+            elif isinstance(obj, (np.int32, np.int64, int)):
+                return int(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()  # Convert numpy arrays to lists
+            # Skip state dicts - store only parameters
+            elif isinstance(obj, (torch.nn.parameter.Parameter, torch.Tensor)):
+                return "TENSOR_PLACEHOLDER"
+            else:
+                # Return other objects as is (strings, booleans, etc.)
+                return obj
+        
+        serializable_progress = make_serializable(progress)
+        
+        # Save progress
+        with open(self.progress_path, 'w') as f:
+            json.dump(serializable_progress, f, indent=2)
+        
+        print(f"Progress saved to {self.progress_path}")
+    
+    def _load_progress(self):
+        """Load progress from previous runs"""
+        if os.path.exists(self.progress_path):
+            try:
+                with open(self.progress_path, 'r') as f:
+                    progress = json.load(f)
+                print(f"Loading previous progress: {progress.get('folds_completed', 0)} folds completed")
+                
+                # Load model state dicts
+                for fold in range(1, progress.get('folds_completed', 0) + 1):
+                    model_path = os.path.join(self.save_dir, f"model_fold{fold}.pt")
+                    if os.path.exists(model_path):
+                        state_dict = torch.load(model_path, map_location=self.device)
+                        if 'best_models' not in progress:
+                            progress['best_models'] = []
+                        progress['best_models'].append(state_dict)
+                    else:
+                        print(f"Warning: Model file {model_path} not found")
+                
+                return progress
+            except Exception as e:
+                print(f"Error loading progress: {e}")
+                return {}
+        else:
+            print("No previous progress found, starting fresh")
+            return {}
+    
     def _save_results(self, results):
         """Save cross-validation results to file"""
         results_path = os.path.join(self.save_dir, 'cv_results.json')
@@ -512,19 +640,23 @@ class CrossValidationTrainer:
             if k not in ('model_class', 'train_dataset', 'val_dataset', 'test_dataset')
         }
         
-        # Make sure everything is JSON serializable
+        # Make sure everything is JSON serializable with improved type checking
         def make_serializable(obj):
             if isinstance(obj, dict):
                 return {k: make_serializable(v) for k, v in obj.items()}
             elif isinstance(obj, list):
                 return [make_serializable(item) for item in obj]
-            elif isinstance(obj, (np.float32, np.float64)):
+            elif isinstance(obj, (np.float32, np.float64, float)):
+                # Only check for NaN on floating point types
+                if np.isnan(obj):
+                    return "NaN"
                 return float(obj)
-            elif isinstance(obj, (np.int32, np.int64)):
+            elif isinstance(obj, (np.int32, np.int64, int)):
                 return int(obj)
-            elif np.isnan(obj):
-                return "NaN"
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()  # Convert numpy arrays to lists
             else:
+                # Return other objects as is (strings, booleans, etc.)
                 return obj
         
         serializable_results = make_serializable(results)

@@ -182,5 +182,8 @@ memory_xlstm.md
 model_edaic_xlstm/analysis/
 model_edaic_xlstm/# Approaches for Addressing Class Imbala.md
 
+model_binary/xlstm
+model_binary/results
+
 *.json
 *.png
