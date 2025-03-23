@@ -14,33 +14,16 @@ from xlstm import (
     FeedForwardConfig,
 )
 
-class DepBinaryClassifier(nn.Module):
-    def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, seq_length=150,
-                 feature_names=None):
-        """
-        Binary classification model for E-DAIC depression detection with interpretability
+class FeatureGroupEncoder(nn.Module):
+    """Encoder for a specific group of features"""
+    def __init__(self, input_size, hidden_size, seq_length, dropout=0.5):
+        super(FeatureGroupEncoder, self).__init__()
         
-        Args:
-            input_size (int): Size of input features (default: 75 - combined pose, gaze and AUs)
-            hidden_size (int): LSTM hidden state size
-            num_layers (int): Number of LSTM layers
-            dropout (float): Dropout probability
-            seq_length (int): Length of input sequences
-            feature_names (list): Names of input features for interpretability
-        """
-        super(DepBinaryClassifier, self).__init__()
-
-        # Store feature names for interpretability
-        self.feature_names = feature_names if feature_names else [f"feature_{i}" for i in range(input_size)]
-        self.input_size = input_size
-        
-        # Project raw input features into the hidden dimension
+        # Initial projection
         self.input_proj = nn.Linear(input_size, hidden_size)
-        
-        # Apply dropout after input projection
         self.input_dropout = nn.Dropout(dropout)
-
-        # Configure the xLSTM stack for non-language applications
+        
+        # xLSTM configuration for this feature group
         cfg = xLSTMBlockStackConfig(
             mlstm_block=mLSTMBlockConfig(
                 mlstm=mLSTMLayerConfig(
@@ -61,9 +44,94 @@ class DepBinaryClassifier(nn.Module):
                 feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu"),
             ),
             context_length=seq_length,
-            num_blocks=num_layers,
+            num_blocks=1,  # Single block per feature group encoder
             embedding_dim=hidden_size,
-            slstm_at=[1],
+            slstm_at=[],  # Use mLSTM for simplicity
+            dropout=dropout,
+            bias=True,
+        )
+        
+        self.xlstm_stack = xLSTMBlockStack(cfg)
+        self.xlstm_stack.reset_parameters()
+    
+    def forward(self, x):
+        """Forward pass for this feature group"""
+        # Project and apply dropout
+        x_proj = self.input_dropout(self.input_proj(x))
+        
+        # Process through xLSTM stack
+        out_seq = self.xlstm_stack(x_proj)
+        
+        # Return full sequence output
+        return out_seq
+
+class DepBinaryClassifier(nn.Module):
+    def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, seq_length=150,
+                 feature_names=None):
+        """
+        Binary classification model for E-DAIC depression detection with interpretability
+        and separate processing pathways for different feature types.
+        
+        Args:
+            input_size (int): Size of input features (default: 75 - combined pose, gaze and AUs)
+            hidden_size (int): LSTM hidden state size
+            num_layers (int): Number of LSTM layers
+            dropout (float): Dropout probability
+            seq_length (int): Length of input sequences
+            feature_names (list): Names of input features for interpretability
+        """
+        super(DepBinaryClassifier, self).__init__()
+
+        # Store feature names for interpretability
+        self.feature_names = feature_names if feature_names else [f"feature_{i}" for i in range(input_size)]
+        self.input_size = input_size
+        
+        # Create feature group indices
+        self.pose_indices, self.gaze_indices, self.au_indices = self._create_feature_group_indices()
+        
+        # Create separate encoders for each feature group
+        self.pose_encoder = FeatureGroupEncoder(
+            input_size=len(self.pose_indices),
+            hidden_size=hidden_size // 2,  # Smaller dimension for pose features
+            seq_length=seq_length,
+            dropout=dropout * 1.5  # Higher dropout for pose features to reduce dominance
+        )
+        
+        self.au_encoder = FeatureGroupEncoder(
+            input_size=len(self.au_indices) + len(self.gaze_indices),  # Combine AUs and gaze
+            hidden_size=hidden_size // 2 + hidden_size // 4,  # Larger dimension for AU features
+            seq_length=seq_length,
+            dropout=dropout
+        )
+        
+        # Merger for feature group encodings
+        self.feature_merger = nn.Linear(hidden_size + hidden_size // 4, hidden_size)
+        self.merger_dropout = nn.Dropout(dropout)
+        
+        # Final xLSTM for sequence processing after feature group merging
+        cfg = xLSTMBlockStackConfig(
+            mlstm_block=mLSTMBlockConfig(
+                mlstm=mLSTMLayerConfig(
+                    conv1d_kernel_size=4,
+                    qkv_proj_blocksize=4,
+                    num_heads=4,
+                    dropout=dropout,
+                )
+            ),
+            slstm_block=sLSTMBlockConfig(
+                slstm=sLSTMLayerConfig(
+                    backend="vanilla",
+                    num_heads=4,
+                    conv1d_kernel_size=4,
+                    bias_init="powerlaw_blockdependent",
+                    dropout=dropout,
+                ),
+                feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu"),
+            ),
+            context_length=seq_length,
+            num_blocks=num_layers - 1,  # Minus 1 because we already have 1 layer in each encoder
+            embedding_dim=hidden_size,
+            slstm_at=[0],  # Use sLSTM for first layer
             dropout=dropout,
             bias=True,
         )
@@ -75,17 +143,55 @@ class DepBinaryClassifier(nn.Module):
         self.fc = nn.Linear(hidden_size, 1)
         self.dropout = nn.Dropout(dropout)
         
-        # For storing feature importance information - initialize as empty dict
+        # Attention layer for combining feature groups
+        self.feature_attention = nn.Linear(hidden_size // 2, 2)  # Match the pose encoder dimension
+        
+        # For storing feature importance information
         self.feature_importances = {}
         self.last_attention_weights = None
-
+    
+    def _create_feature_group_indices(self):
+        """Create indices for each feature group based on feature names"""
+        pose_indices = []
+        gaze_indices = []
+        au_indices = []
+        
+        for i, name in enumerate(self.feature_names):
+            if name.startswith('pose_'):
+                pose_indices.append(i)
+            elif name.startswith('gaze_'):
+                gaze_indices.append(i)
+            elif name.startswith('AU'):
+                au_indices.append(i)
+        
+        return pose_indices, gaze_indices, au_indices
+    
+    def _split_features(self, x):
+        """Split input features into feature groups"""
+        # Create empty tensors for each group
+        batch_size, seq_len, _ = x.shape
+        
+        pose_features = torch.zeros(batch_size, seq_len, len(self.pose_indices), device=x.device)
+        au_gaze_features = torch.zeros(batch_size, seq_len, len(self.au_indices) + len(self.gaze_indices), device=x.device)
+        
+        # Fill with appropriate features
+        for i, idx in enumerate(self.pose_indices):
+            pose_features[:, :, i] = x[:, :, idx]
+        
+        au_gaze_idx = 0
+        for idx in self.gaze_indices + self.au_indices:
+            au_gaze_features[:, :, au_gaze_idx] = x[:, :, idx]
+            au_gaze_idx += 1
+        
+        return pose_features, au_gaze_features
+    
     def forward(self, x, return_intermediates=False):
         """
-        Forward pass with option to return intermediate activations
+        Forward pass with separate pathways for feature groups
         
         Args:
             x (torch.Tensor): Input features [batch, seq_length, input_size]
-            return_intermediates (bool): Whether to return intermediate activations for interpretability
+            return_intermediates (bool): Whether to return intermediate activations
             
         Returns:
             torch.Tensor or tuple: Binary classification logits, or tuple with intermediates
@@ -103,11 +209,25 @@ class DepBinaryClassifier(nn.Module):
                                  device=x.device)
             x = torch.cat([x, padding], dim=1)
         
-        # Project and apply dropout
-        x_proj = self.input_dropout(self.input_proj(x))
+        # Split features into groups
+        pose_features, au_gaze_features = self._split_features(x)
         
-        # Process through xLSTM stack
-        out_seq = self.xlstm_stack(x_proj)  # Output shape: [batch, seq_length, hidden_size]
+        # Process each feature group through its encoder
+        pose_encoded = self.pose_encoder(pose_features)
+        au_gaze_encoded = self.au_encoder(au_gaze_features)
+        
+        # Fix attention calculation - use last timestep's full hidden state
+        # Take the last timestep from pose_encoded without reducing its dimension
+        last_pose = pose_encoded[:, -1, :]  # Shape: [batch_size, hidden_size/2]
+        attention_weights = F.softmax(self.feature_attention(last_pose), dim=-1)
+        self.last_group_attention = attention_weights.detach()
+        
+        # Merge feature group encodings
+        merged = torch.cat([pose_encoded, au_gaze_encoded], dim=2)
+        merged = self.merger_dropout(self.feature_merger(merged))
+        
+        # Process through final xLSTM stack
+        out_seq = self.xlstm_stack(merged)
         
         # Use the last timestep for classification
         out_last = out_seq[:, -1, :]
@@ -116,7 +236,17 @@ class DepBinaryClassifier(nn.Module):
         
         # Return raw logits (no sigmoid) for use with BCEWithLogitsLoss
         if return_intermediates:
-            return logits, {'input': x, 'projected': x_proj, 'sequence_out': out_seq, 'final_out': out_last}
+            return logits, {
+                'input': x, 
+                'pose_features': pose_features,
+                'au_gaze_features': au_gaze_features,
+                'pose_encoded': pose_encoded, 
+                'au_gaze_encoded': au_gaze_encoded,
+                'merged': merged,
+                'sequence_out': out_seq, 
+                'final_out': out_last,
+                'group_attention': attention_weights
+            }
         return logits
     
     def predict_proba(self, x):
@@ -174,6 +304,13 @@ class DepBinaryClassifier(nn.Module):
             list: Attention weights from each layer
         """
         attention_weights = []
+        
+        # Extract feature group attention
+        if hasattr(self, 'last_group_attention'):
+            attention_weights.append({
+                'layer': 'feature_group_attention',
+                'weights': self.last_group_attention
+            })
         
         # Extract attention weights from mLSTM and sLSTM layers
         for block_idx, block in enumerate(self.xlstm_stack.blocks):

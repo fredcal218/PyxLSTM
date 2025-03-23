@@ -3,12 +3,14 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
 
 class EDAICDataset(Dataset):
     """
     Dataset class for E-DAIC depression binary classification
     """
-    def __init__(self, data_dir, labels_path, split='train', max_seq_length=150, confidence_threshold=0.9):
+    def __init__(self, data_dir, labels_path, split='train', max_seq_length=150, confidence_threshold=0.9, 
+                feature_scalers=None, is_train=False):
         """
         Initialize E-DAIC dataset
         
@@ -18,11 +20,15 @@ class EDAICDataset(Dataset):
             split (str): Dataset split ('train', 'dev', or 'test')
             max_seq_length (int): Maximum sequence length to use
             confidence_threshold (float): Minimum confidence value to include a frame
+            feature_scalers (dict): Dictionary of feature scalers for normalization
+            is_train (bool): Whether this is the training set (for fitting scalers)
         """
         self.data_dir = data_dir
         self.max_seq_length = max_seq_length
         self.split = split
         self.confidence_threshold = confidence_threshold
+        self.feature_scalers = feature_scalers
+        self.is_train = is_train
         
         # Load labels
         self.labels_df = pd.read_csv(labels_path)
@@ -66,6 +72,12 @@ class EDAICDataset(Dataset):
                 # Include AU intensity features but exclude confidence
                 elif col.startswith('AU') and not col.endswith('_c'):
                     self.feature_names.append(col)
+                    
+            # Initialize feature scalers if we're the training set and no scalers provided
+            if is_train and feature_scalers is None:
+                self.feature_scalers = {feature: StandardScaler() for feature in self.feature_names}
+            else:
+                self.feature_scalers = feature_scalers
         else:
             self.feature_names = []
             print(f"Warning: No feature files found for {split} split")
@@ -90,7 +102,27 @@ class EDAICDataset(Dataset):
             print(f"Warning: No frames with confidence >= {self.confidence_threshold} for {pid}. Using all frames.")
         
         # Extract relevant features (pose, gaze, and AUs)
-        features = df[self.feature_names].values
+        features_df = df[self.feature_names]
+        
+        # Normalize features if scalers are available
+        if self.feature_scalers:
+            normalized_features = features_df.copy()
+            
+            # Apply scaling for each feature separately
+            for feature in self.feature_names:
+                feature_values = features_df[feature].values.reshape(-1, 1)
+                
+                # Fit scaler if this is training set, otherwise just transform
+                if self.is_train:
+                    normalized_values = self.feature_scalers[feature].fit_transform(feature_values)
+                else:
+                    normalized_values = self.feature_scalers[feature].transform(feature_values)
+                    
+                normalized_features[feature] = normalized_values.flatten()
+            
+            features = normalized_features.values
+        else:
+            features = features_df.values
         
         # Handle sequence length
         if features.shape[0] > self.max_seq_length:
@@ -132,6 +164,10 @@ class EDAICDataset(Dataset):
             'non_depressed': non_depressed,
             'total': len(self.valid_participants)
         }
+    
+    def get_feature_scalers(self):
+        """Get fitted feature scalers for transfer to other datasets"""
+        return self.feature_scalers
 
 def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, confidence_threshold=0.9):
     """
@@ -147,13 +183,53 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
     Returns:
         dict: Dictionary of dataloaders and datasets for train, dev, and test sets
     """
-    # Create datasets
+    # Create training dataset first to fit the normalizers
     train_dataset = EDAICDataset(
         data_dir=data_dir,
         labels_path=os.path.join(labels_dir, "train_split.csv"),
         split='train',
         max_seq_length=max_seq_length,
-        confidence_threshold=confidence_threshold
+        confidence_threshold=confidence_threshold,
+        feature_scalers=None,  # Will initialize new scalers
+        is_train=True  # Will fit the scalers
+    )
+    
+    # Pre-fit the scalers on all training data
+    print("Fitting feature normalizers on training data...")
+    all_feature_data = {}
+    for feature in train_dataset.feature_names:
+        all_feature_data[feature] = []
+    
+    # Collect feature values across all training participants
+    for idx in range(len(train_dataset)):
+        sample = train_dataset[idx]
+        features = sample['features'].numpy()
+        seq_length = sample['seq_length']
+        
+        # Only use valid sequence length (not padding)
+        valid_features = features[:seq_length]
+        
+        # Add to collection for each feature
+        for i, feature_name in enumerate(train_dataset.feature_names):
+            all_feature_data[feature_name].extend(valid_features[:, i].tolist())
+    
+    # Fit each scaler on collected data
+    feature_scalers = {}
+    for feature in train_dataset.feature_names:
+        if len(all_feature_data[feature]) > 0:
+            scaler = StandardScaler()
+            scaler.fit(np.array(all_feature_data[feature]).reshape(-1, 1))
+            feature_scalers[feature] = scaler
+    
+    # Create datasets with fitted scalers
+    train_dataset = EDAICDataset(
+        data_dir=data_dir,
+        labels_path=os.path.join(labels_dir, "train_split.csv"),
+        split='train',
+        max_seq_length=max_seq_length,
+        confidence_threshold=confidence_threshold,
+        feature_scalers=feature_scalers,
+        is_train=False  # Don't refit, just transform
     )
     
     dev_dataset = EDAICDataset(
@@ -161,7 +237,9 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
         labels_path=os.path.join(labels_dir, "dev_split.csv"),
         split='dev',
         max_seq_length=max_seq_length,
-        confidence_threshold=confidence_threshold
+        confidence_threshold=confidence_threshold,
+        feature_scalers=feature_scalers,
+        is_train=False
     )
     
     test_dataset = EDAICDataset(
@@ -169,7 +247,9 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, con
         labels_path=os.path.join(labels_dir, "test_split.csv"),
         split='test',
         max_seq_length=max_seq_length,
-        confidence_threshold=confidence_threshold
+        confidence_threshold=confidence_threshold,
+        feature_scalers=feature_scalers,
+        is_train=False
     )
     
     # Print dataset statistics

@@ -3,6 +3,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -30,7 +31,6 @@ def set_seed(seed=SEED):
         # Make CUDA operations deterministic
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    print(f"Random seed set to {seed} for reproducibility")
 
 # Call set_seed at the beginning
 set_seed()
@@ -150,7 +150,7 @@ def train():
             optimizer.zero_grad()
             logits = model(features)  # Get logits (no sigmoid)
             
-            # Calculate loss with class weighting via BCEWithLogitsLoss
+            # Calculate loss with class weighting (removed pose_Tz regularization)
             loss = criterion(logits, binary_labels)
             
             # Backward pass and optimize
