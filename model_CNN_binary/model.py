@@ -5,10 +5,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-class FeatureGroupCNN(nn.Module):
-    """CNN encoder for a specific group of features"""
+class SimpleCNNEncoder(nn.Module):
+    """Simplified CNN encoder for all features combined"""
     def __init__(self, input_size, hidden_size, seq_length, dropout=0.5, num_conv_layers=3):
-        super(FeatureGroupCNN, self).__init__()
+        super(SimpleCNNEncoder, self).__init__()
         
         # Initial projection to match hidden size
         self.input_proj = nn.Linear(input_size, hidden_size)
@@ -17,7 +17,7 @@ class FeatureGroupCNN(nn.Module):
         # Create a stack of 1D convolutional layers
         self.conv_layers = nn.ModuleList()
         for i in range(num_conv_layers):
-            # Calculate proper padding to maintain sequence length with dilated convolutions
+            # Calculate proper padding to maintain sequence length
             dilation = 2**i
             kernel_size = 3
             padding = (kernel_size - 1) * dilation // 2
@@ -28,7 +28,7 @@ class FeatureGroupCNN(nn.Module):
                     in_channels=hidden_size,
                     out_channels=hidden_size,
                     kernel_size=kernel_size,
-                    padding=padding,  # Updated to scale with dilation
+                    padding=padding,
                     dilation=dilation
                 ),
                 nn.BatchNorm1d(hidden_size),
@@ -37,12 +37,8 @@ class FeatureGroupCNN(nn.Module):
             )
             self.conv_layers.append(conv_layer)
         
-        # Global attention pooling
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_size // 2, 1)
-        )
+        # Global average pooling (simplified from attention pooling)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
         
     def forward(self, x):
         """Forward pass
@@ -59,7 +55,7 @@ class FeatureGroupCNN(nn.Module):
         # Transpose for conv1d: [batch, channels, seq_len]
         x_conv = x_proj.transpose(1, 2)  # [batch, hidden_size, seq_len]
         
-        # Apply convolutional layers
+        # Apply convolutional layers with residual connections
         for conv_layer in self.conv_layers:
             x_conv = conv_layer(x_conv) + x_conv  # Residual connection
             
@@ -67,32 +63,108 @@ class FeatureGroupCNN(nn.Module):
         x_out = x_conv.transpose(1, 2)
         
         return x_out
-        
-    def apply_attention(self, x):
-        """Apply attention pooling to get sequence representation
+    
+    def pool_sequence(self, x):
+        """Pool sequence into a single vector using average pooling
         Args:
             x: Tensor [batch_size, seq_length, hidden_size]
         Returns:
             Pooled representation [batch_size, hidden_size]
         """
-        # Calculate attention scores
-        attn_scores = self.attention(x).squeeze(-1)  # [batch, seq_len]
-        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)  # [batch, seq_len, 1]
+        # Transpose to [batch, hidden_size, seq_len] for pooling
+        x_t = x.transpose(1, 2)
         
-        # Store for visualization
-        self.last_attn_weights = attn_weights.detach()
+        # Apply global average pooling
+        pooled = self.global_pool(x_t).squeeze(-1)  # [batch, hidden_size]
         
-        # Apply attention weights
-        attended = torch.sum(x * attn_weights, dim=1)  # [batch, hidden_size]
+        return pooled
+
+class FeatureGroupBalancer(nn.Module):
+    """
+    Module to balance the influence of different feature groups (pose, AU, gaze)
+    by applying group-specific scaling and learnable weights.
+    """
+    def __init__(self, feature_names, pose_scaling_factor=0.5):
+        super(FeatureGroupBalancer, self).__init__()
         
-        return attended
+        # Identify feature group indices
+        self.pose_indices, self.gaze_indices, self.au_indices = self._identify_feature_groups(feature_names)
+        
+        # Set feature group scaling factors (fixed)
+        self.pose_scaling_factor = pose_scaling_factor
+        
+        # Create learnable weights for each feature group (initialized to balance groups)
+        self.feature_group_weights = nn.Parameter(torch.ones(3))  # [pose, gaze, AU]
+        
+        # Store feature names for reference
+        self.feature_names = feature_names
+        
+    def _identify_feature_groups(self, feature_names):
+        """Identify indices for each feature group"""
+        pose_indices = []
+        gaze_indices = []
+        au_indices = []
+        
+        for i, name in enumerate(feature_names):
+            if name.startswith('pose_'):
+                pose_indices.append(i)
+            elif name.startswith('gaze_'):
+                gaze_indices.append(i)
+            elif name.startswith('AU'):
+                au_indices.append(i)
+        
+        return pose_indices, gaze_indices, au_indices
+        
+    def forward(self, x):
+        """
+        Apply feature group balancing
+        
+        Args:
+            x: Input features [batch_size, seq_length, input_size]
+            
+        Returns:
+            Balanced features with same shape
+        """
+        batch_size, seq_length, input_size = x.shape
+        
+        # Create a copy to modify
+        balanced_x = x.clone()
+        
+        # Apply fixed scaling to pose features to reduce their impact
+        if self.pose_indices:
+            balanced_x[:, :, self.pose_indices] *= self.pose_scaling_factor
+        
+        # Apply learned feature group weights (softmax normalized)
+        weights = F.softmax(self.feature_group_weights, dim=0)
+        
+        # Apply weights to each feature group
+        if self.pose_indices:
+            balanced_x[:, :, self.pose_indices] *= weights[0]
+        if self.gaze_indices:
+            balanced_x[:, :, self.gaze_indices] *= weights[1]
+        if self.au_indices:
+            balanced_x[:, :, self.au_indices] *= weights[2]
+            
+        return balanced_x
+    
+    def get_regularization_loss(self):
+        """
+        Get L1 regularization loss for pose feature weights
+        to encourage the model to rely less on pose features
+        """
+        weights = F.softmax(self.feature_group_weights, dim=0)
+        return weights[0]  # L1 penalty on pose weight only
+    
+    def get_group_weights(self):
+        """Return the current feature group weights (softmax normalized)"""
+        return F.softmax(self.feature_group_weights, dim=0).detach()  # Detach tensor before returning
 
 class DepBinaryClassifier(nn.Module):
     def __init__(self, input_size=75, hidden_size=128, num_layers=3, dropout=0.5, seq_length=150,
-                 feature_names=None, include_pose=True):
+                 feature_names=None, include_pose=True, pose_scaling_factor=0.5):
         """
-        Binary classification model for E-DAIC depression detection with interpretability
-        using 1D CNNs instead of LSTM/Transformer.
+        Binary classification model for depression detection with simplified CNN architecture
+        and feature group balancing.
         
         Args:
             input_size (int): Size of input features
@@ -102,6 +174,7 @@ class DepBinaryClassifier(nn.Module):
             seq_length (int): Length of input sequences
             feature_names (list): Names of input features for interpretability
             include_pose (bool): Whether pose features are included
+            pose_scaling_factor (float): Scaling factor to reduce pose feature impact (0-1)
         """
         super(DepBinaryClassifier, self).__init__()
 
@@ -110,67 +183,37 @@ class DepBinaryClassifier(nn.Module):
         self.input_size = input_size
         self.include_pose = include_pose
         
-        # Create feature group indices
+        # Create feature group indices for feature importance analysis
         self.pose_indices, self.gaze_indices, self.au_indices = self._create_feature_group_indices()
         
-        # If pose features are included, create separate encoders
-        if include_pose and len(self.pose_indices) > 0:
-            # Create separate encoders for each feature group
-            self.pose_encoder = FeatureGroupCNN(
-                input_size=len(self.pose_indices),
-                hidden_size=hidden_size // 2,  # Smaller dimension for pose features
-                seq_length=seq_length,
-                dropout=dropout * 1.5,  # Higher dropout for pose features
-                num_conv_layers=num_layers
-            )
-            
-            self.au_encoder = FeatureGroupCNN(
-                input_size=len(self.au_indices) + len(self.gaze_indices),  # Combine AUs and gaze
-                hidden_size=hidden_size // 2 + hidden_size // 4,  # Larger dimension for AU features
-                seq_length=seq_length,
-                dropout=dropout,
-                num_conv_layers=num_layers
-            )
-            
-            # Merger for feature group encodings
-            merged_size = hidden_size + hidden_size // 4
-            self.feature_merger = nn.Linear(merged_size, hidden_size)
-            self.merger_dropout = nn.Dropout(dropout)
-            
-            # Attention layer for combining feature groups
-            self.feature_attention = nn.Linear(hidden_size // 2, 2)  # Match the pose encoder dimension
-        else:
-            # If no pose features, use a single encoder for AUs and gaze
-            self.au_gaze_encoder = FeatureGroupCNN(
-                input_size=len(self.au_indices) + len(self.gaze_indices),
-                hidden_size=hidden_size,
-                seq_length=seq_length,
-                dropout=dropout,
-                num_conv_layers=num_layers
-            )
-        
-        # Final sequence model: a stack of 1D CNN layers with global pooling
-        self.feature_pooling = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size)
+        # Feature group balancer to handle pose feature dominance
+        self.feature_balancer = FeatureGroupBalancer(
+            feature_names=self.feature_names,
+            pose_scaling_factor=pose_scaling_factor
         )
         
-        # Global attention pooling
-        self.global_attention = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.Tanh(), 
-            nn.Linear(hidden_size // 2, 1)
+        # Single encoder for all features (simplified architecture)
+        self.encoder = SimpleCNNEncoder(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            seq_length=seq_length,
+            dropout=dropout,
+            num_conv_layers=num_layers
+        )
+        
+        # Final feature processing
+        self.feature_processing = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout)
         )
         
         # Output layer for binary classification
         self.fc = nn.Linear(hidden_size, 1)
-        self.dropout = nn.Dropout(dropout)
         
         # For storing feature importance information
         self.feature_importances = {}
-        self.last_attention_weights = None
+        self.last_attention_weights = None  # Kept for compatibility
     
     def _create_feature_group_indices(self):
         """Create indices for each feature group based on feature names"""
@@ -188,39 +231,9 @@ class DepBinaryClassifier(nn.Module):
         
         return pose_indices, gaze_indices, au_indices
     
-    def _split_features(self, x):
-        """Split input features into feature groups"""
-        # Create empty tensors for each group
-        batch_size, seq_len, _ = x.shape
-        
-        if self.include_pose and len(self.pose_indices) > 0:
-            pose_features = torch.zeros(batch_size, seq_len, len(self.pose_indices), device=x.device)
-            au_gaze_features = torch.zeros(batch_size, seq_len, len(self.au_indices) + len(self.gaze_indices), device=x.device)
-            
-            # Fill with appropriate features
-            for i, idx in enumerate(self.pose_indices):
-                pose_features[:, :, i] = x[:, :, idx]
-            
-            au_gaze_idx = 0
-            for idx in self.gaze_indices + self.au_indices:
-                au_gaze_features[:, :, au_gaze_idx] = x[:, :, idx]
-                au_gaze_idx += 1
-            
-            return pose_features, au_gaze_features
-        else:
-            # If no pose features, just return AU and gaze features
-            au_gaze_features = torch.zeros(batch_size, seq_len, len(self.au_indices) + len(self.gaze_indices), device=x.device)
-            
-            au_gaze_idx = 0
-            for idx in self.gaze_indices + self.au_indices:
-                au_gaze_features[:, :, au_gaze_idx] = x[:, :, idx]
-                au_gaze_idx += 1
-            
-            return None, au_gaze_features
-    
     def forward(self, x, return_intermediates=False):
         """
-        Forward pass with separate pathways for feature groups if pose is included
+        Forward pass with feature group balancing
         
         Args:
             x (torch.Tensor): Input features [batch, seq_length, input_size]
@@ -229,104 +242,56 @@ class DepBinaryClassifier(nn.Module):
         Returns:
             torch.Tensor or tuple: Binary classification logits, or tuple with intermediates
         """
-        # x shape: [batch, seq_length, input_size]
-        batch_size, seq_len, _ = x.shape
+        # Store intermediates if requested
+        intermediates = {'input': x} if return_intermediates else {}
         
-        # Split features into groups
-        pose_features, au_gaze_features = self._split_features(x)
+        # Apply feature group balancing
+        balanced_x = self.feature_balancer(x)
         
-        intermediates = {'input': x, 'au_gaze_features': au_gaze_features}
-        
-        if self.include_pose and pose_features is not None:
-            # Process each feature group through its encoder
-            pose_encoded = self.pose_encoder(pose_features)
-            au_gaze_encoded = self.au_encoder(au_gaze_features)
-            
-            intermediates['pose_features'] = pose_features
-            intermediates['pose_encoded'] = pose_encoded
-            intermediates['au_gaze_encoded'] = au_gaze_encoded
-            
-            # Apply attention to pose features
-            pose_attended = self.pose_encoder.apply_attention(pose_encoded)
-            
-            # Apply attention to AU/gaze features
-            au_gaze_attended = self.au_encoder.apply_attention(au_gaze_encoded)
-            
-            # Apply feature attention to combine groups
-            attention_weights = F.softmax(self.feature_attention(pose_attended), dim=-1)
-            self.last_group_attention = attention_weights.detach()
-            
-            intermediates['group_attention'] = attention_weights
-            
-            # Merge feature group encodings
-            merged = torch.cat([pose_encoded, au_gaze_encoded], dim=2)
-            merged = self.merger_dropout(self.feature_merger(merged))
-            
-            intermediates['merged'] = merged
-            
-            # Apply global attention pooling
-            attn_scores = self.global_attention(merged).squeeze(-1)
-            attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)
-            self.last_attention_weights = attn_weights.detach()
-            
-            out_seq = merged
-            pooled = torch.sum(out_seq * attn_weights, dim=1)
-            
-        else:
-            # If no pose features, process through the AU/gaze encoder
-            out_seq = self.au_gaze_encoder(au_gaze_features)
-            
-            # Apply global attention pooling
-            attn_scores = self.global_attention(out_seq).squeeze(-1)
-            attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)
-            self.last_attention_weights = attn_weights.detach()
-            
-            pooled = torch.sum(out_seq * attn_weights, dim=1)
-        
-        intermediates['sequence_out'] = out_seq
-        intermediates['attention_weights'] = attn_weights
-        
-        # Apply feature pooling and final classification
-        out_features = self.feature_pooling(pooled)
-        out_features = self.dropout(out_features)
-        logits = self.fc(out_features)
-        
-        intermediates['final_out'] = out_features
-        
-        # Return raw logits (no sigmoid) for use with BCEWithLogitsLoss
         if return_intermediates:
+            intermediates['balanced_input'] = balanced_x
+        
+        # Process through CNN encoder
+        encoded_features = self.encoder(balanced_x)
+        
+        if return_intermediates:
+            intermediates['encoded_features'] = encoded_features
+        
+        # Pool sequence to get a single vector per example
+        pooled = self.encoder.pool_sequence(encoded_features)
+        
+        if return_intermediates:
+            intermediates['pooled'] = pooled
+        
+        # Final processing
+        features = self.feature_processing(pooled)
+        
+        # Output layer
+        logits = self.fc(features)
+        
+        if return_intermediates:
+            intermediates['final_features'] = features
             return logits, intermediates
         
         return logits
     
+    def get_regularization_loss(self, reg_strength=0.01):
+        """Get regularization loss to discourage over-reliance on pose features"""
+        return reg_strength * self.feature_balancer.get_regularization_loss()
+    
+    def get_feature_group_weights(self):
+        """Return the current feature group weights"""
+        return self.feature_balancer.get_group_weights()
+    
     def predict_proba(self, x):
-        """
-        Get probability predictions by applying sigmoid to logits
-        
-        Args:
-            x (torch.Tensor): Input features
-            
-        Returns:
-            torch.Tensor: Probability predictions
-        """
+        """Get probability predictions by applying sigmoid to logits"""
         logits = self(x)
         return torch.sigmoid(logits)
     
     def calculate_metrics(self, logits, targets, threshold=0.0):
-        """
-        Calculate binary classification metrics
-        
-        Args:
-            logits (torch.Tensor): Model's output logits
-            targets (torch.Tensor): Ground truth binary labels
-            threshold (float): Classification threshold on logits (0.0 = default decision boundary)
-            
-        Returns:
-            dict: Dictionary containing accuracy, precision, recall, and F1 score
-        """
+        """Calculate binary classification metrics"""
         # Convert logits to binary predictions using threshold
-        probs = torch.sigmoid(logits)
-        binary_preds = (logits > threshold).float()  # or (probs > 0.5)
+        binary_preds = (logits > threshold).float()
         
         # Calculate metrics
         tp = ((binary_preds == 1) & (targets == 1)).float().sum()
@@ -345,32 +310,12 @@ class DepBinaryClassifier(nn.Module):
             'recall': recall.item(),
             'f1': f1.item()
         }
-    
+
     def get_attention_weights(self):
-        """
-        Extract attention weights from the model
-        
-        Returns:
-            list: Attention weights from each layer
-        """
-        attention_weights = []
-        
-        # Extract feature group attention if available
-        if hasattr(self, 'last_group_attention'):
-            attention_weights.append({
-                'layer': 'feature_group_attention',
-                'weights': self.last_group_attention
-            })
-        
-        # Extract global attention weights if available
-        if hasattr(self, 'last_attention_weights'):
-            attention_weights.append({
-                'layer': 'global_attention',
-                'weights': self.last_attention_weights
-            })
-        
-        return attention_weights
+        """Returns empty list since we don't use attention in the simplified model"""
+        return []
     
+    # Keep the existing feature importance methods for compatibility
     def gradient_feature_importance(self, x, target_class=1):
         """
         Calculate feature importance using gradient-based attribution
@@ -557,7 +502,7 @@ class DepBinaryClassifier(nn.Module):
         }
     
     def visualize_feature_importance(self, importance_dict=None, top_k=20, save_path=None, 
-                                   title="Top Feature Importance for Depression Detection"):
+                                  title="Top Feature Importance for Depression Detection"):
         """
         Visualize feature importance
         
@@ -713,3 +658,41 @@ class DepBinaryClassifier(nn.Module):
                                    reverse=True)}
         
         return clinical_importance
+    
+    def visualize_feature_group_weights(self, save_path=None):
+        """Visualize current feature group weights"""
+        weights = self.get_feature_group_weights().detach().cpu().numpy()
+        
+        # Create labels based on which groups exist
+        labels = []
+        values = []
+        
+        if self.pose_indices:
+            labels.append('Pose Features')
+            values.append(weights[0])
+        if self.gaze_indices:
+            labels.append('Gaze Features')
+            values.append(weights[1])
+        if self.au_indices:
+            labels.append('Action Units')
+            values.append(weights[2])
+        
+        # Create visualization
+        plt.figure(figsize=(8, 5))
+        bars = plt.bar(labels, values, color=['lightcoral', 'lightblue', 'lightgreen'])
+        
+        # Add value labels on bars
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                    f'{height:.2f}', ha='center', va='bottom')
+        
+        plt.ylabel('Weight')
+        plt.title('Feature Group Weights')
+        plt.ylim(0, 1.0)
+        
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+            
+        return plt.gcf()

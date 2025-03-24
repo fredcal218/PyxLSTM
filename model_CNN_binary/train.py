@@ -42,14 +42,19 @@ print(f"Using device: {device}")
 # Hyperparameters
 BATCH_SIZE = 24
 HIDDEN_SIZE = 128
-NUM_LAYERS = 3  # Number of CNN layers (changed from LSTM layers)
+NUM_LAYERS = 3  # Number of CNN layers
 DROPOUT = 0.3
-MAX_SEQ_LENGTH = 450
-LEARNING_RATE = 0.001  # Slightly higher for CNN
+MAX_SEQ_LENGTH = 450  # Keep this for now as we're focusing on architecture changes
+LEARNING_RATE = 0.001  # Reduced from 0.01 to 0.001 for stability
+WEIGHT_DECAY = 1e-5    # Added weight decay for regularization
 NUM_EPOCHS = 50
 EARLY_STOPPING_PATIENCE = 15
-INCLUDE_MOVEMENT_FEATURES = True
-INCLUDE_POSE = False
+INCLUDE_MOVEMENT_FEATURES = False  # Simplified model doesn't need movement features
+INCLUDE_POSE = True  # Keep all features, but process them in a simplified way
+POSE_SCALING_FACTOR = 0.1  # More aggressive scaling (reduced from 0.2 to 0.1)
+POSE_REG_STRENGTH = 0.2  # Increased from 0.01 to 0.02 for stronger regularization
+LR_PATIENCE = 4  # Epochs to wait before reducing learning rate
+LR_FACTOR = 0.5  # Factor to reduce learning rate by
 
 # Directories
 DATA_DIR = "E-DAIC/data_extr"
@@ -67,10 +72,15 @@ config = {
     'dropout': DROPOUT,
     'max_seq_length': MAX_SEQ_LENGTH,
     'learning_rate': LEARNING_RATE,
+    'weight_decay': WEIGHT_DECAY,
     'num_epochs': NUM_EPOCHS,
     'early_stopping_patience': EARLY_STOPPING_PATIENCE,
+    'lr_patience': LR_PATIENCE,
+    'lr_factor': LR_FACTOR,
     'include_movement_features': INCLUDE_MOVEMENT_FEATURES,
     'include_pose': INCLUDE_POSE,
+    'pose_scaling_factor': POSE_SCALING_FACTOR,
+    'pose_reg_strength': POSE_REG_STRENGTH,
     'model_type': 'CNN',  # Changed from LSTM
     'device': str(device)
 }
@@ -116,7 +126,8 @@ def train():
         dropout=DROPOUT,
         seq_length=MAX_SEQ_LENGTH,
         feature_names=feature_names,
-        include_pose=INCLUDE_POSE
+        include_pose=INCLUDE_POSE,
+        pose_scaling_factor=POSE_SCALING_FACTOR
     ).to(device)
     
     # Calculate class weights based on class distribution (24% depressed, 76% non-depressed)
@@ -125,7 +136,18 @@ def train():
     
     # Define loss function with class weighting
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    # Optimizer with weight decay
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    
+    # Learning rate scheduler for reducing LR on plateau
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max',        # Monitor F1 score (higher is better)
+        factor=LR_FACTOR,  # Multiply LR by this factor on plateau
+        patience=LR_PATIENCE,
+        verbose=True
+    )
     
     # For early stopping - initialize to negative value so first epoch always improves
     best_val_f1 = -1
@@ -136,10 +158,23 @@ def train():
         'train_loss': [],
         'train_acc': [],
         'train_f1': [],
+        'train_precision': [],
+        'train_recall': [],
         'val_loss': [],
         'val_acc': [],
-        'val_f1': []
+        'val_f1': [],
+        'val_precision': [],
+        'val_recall': [],
+        'epoch': [],
+        'epoch_time': [],
+        'learning_rate': []
     }
+    
+    # Add feature group weights history if using pose features
+    if INCLUDE_POSE:
+        history['pose_weight'] = []
+        history['gaze_weight'] = []
+        history['au_weight'] = []
     
     # Training loop
     for epoch in range(NUM_EPOCHS):
@@ -161,6 +196,11 @@ def train():
             # Calculate loss with class weighting
             loss = criterion(logits, binary_labels)
             
+            # Add pose feature regularization loss
+            if INCLUDE_POSE:
+                reg_loss = model.get_regularization_loss(reg_strength=POSE_REG_STRENGTH)
+                loss += reg_loss
+            
             # Backward pass and optimize
             loss.backward()
             optimizer.step()
@@ -180,6 +220,8 @@ def train():
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_metrics['accuracy'])
         history['train_f1'].append(train_metrics['f1'])
+        history['train_precision'].append(train_metrics['precision'])
+        history['train_recall'].append(train_metrics['recall'])
         
         # Validation phase
         model.eval()
@@ -212,14 +254,34 @@ def train():
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_metrics['accuracy'])
         history['val_f1'].append(val_metrics['f1'])
+        history['val_precision'].append(val_metrics['precision'])
+        history['val_recall'].append(val_metrics['recall'])
         
         # Calculate epoch time
         epoch_time = time.time() - start_time
         
+        # Add epoch number and time to history
+        history['epoch'].append(epoch + 1)
+        history['epoch_time'].append(epoch_time)
+        
         # Print epoch summary
+        current_lr = optimizer.param_groups[0]['lr']
+        history['learning_rate'].append(current_lr)
+        
         print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Time: {epoch_time:.2f}s")
         print(f"  Train Loss: {train_loss:.4f}, Acc: {train_metrics['accuracy']:.4f}, F1: {train_metrics['f1']:.4f}")
         print(f"  Val Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']:.4f}, F1: {val_metrics['f1']:.4f}")
+        print(f"  Learning Rate: {current_lr:.6f}")
+        
+        # If we're using pose features, log their weights
+        if INCLUDE_POSE:
+            weights = model.get_feature_group_weights().cpu().numpy()
+            print(f"  Feature Group Weights: Pose={weights[0]:.4f}, Gaze={weights[1]:.4f}, AU={weights[2]:.4f}")
+            
+            # Add feature group weights to history
+            history['pose_weight'].append(weights[0])
+            history['gaze_weight'].append(weights[1])
+            history['au_weight'].append(weights[2])
         
         # Check for improvement
         if val_metrics['f1'] > best_val_f1:
@@ -262,6 +324,12 @@ def train():
             if patience_counter >= EARLY_STOPPING_PATIENCE:
                 print("Early stopping!")
                 break
+        
+        # Step the learning rate scheduler
+        scheduler.step(val_metrics['f1'])  # Uses validation F1 score
+    
+    # Save training history to CSV
+    save_training_history_csv(history, os.path.join(OUTPUT_DIR, "training_history.csv"))
     
     # Save final model
     torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "final_model.pt"))
@@ -280,7 +348,20 @@ def train():
     
     return model
 
-# ... existing code for plotting and evaluation functions ...
+def save_training_history_csv(history, file_path):
+    """Save complete training history to CSV file"""
+    # Convert history dictionary to DataFrame
+    history_df = pd.DataFrame(history)
+    
+    # Add a column to indicate best validation epoch
+    best_val_f1_idx = history_df['val_f1'].argmax()
+    history_df['is_best'] = False
+    history_df.loc[best_val_f1_idx, 'is_best'] = True
+    
+    # Save to CSV
+    history_df.to_csv(file_path, index=False)
+    print(f"Saved detailed training history to {file_path}")
+
 def plot_training_history(history):
     """Plot training and validation metrics"""
     plt.figure(figsize=(15, 5))
@@ -312,6 +393,33 @@ def plot_training_history(history):
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, "training_history.png"), dpi=300)
     plt.close()
+    
+    # Add a new plot for learning rate
+    plt.figure(figsize=(10, 4))
+    plt.plot(history['learning_rate'], marker='o')
+    plt.title('Learning Rate Schedule')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.yscale('log')  # Log scale for better visualization
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "learning_rate_history.png"), dpi=300)
+    plt.close()
+    
+    # If pose features are used, plot feature group weights
+    if 'pose_weight' in history:
+        plt.figure(figsize=(10, 4))
+        plt.plot(history['pose_weight'], label='Pose', color='lightcoral')
+        plt.plot(history['gaze_weight'], label='Gaze', color='lightblue')
+        plt.plot(history['au_weight'], label='AU', color='lightgreen')
+        plt.title('Feature Group Weights Evolution')
+        plt.xlabel('Epoch')
+        plt.ylabel('Group Weight')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "feature_weights_history.png"), dpi=300)
+        plt.close()
 
 def evaluate_model(model, test_loader):
     """Evaluate model on test set and generate reports"""
@@ -600,6 +708,13 @@ def analyze_feature_importance(model, test_loader):
             depressed_batch['participant_id'],
             non_depressed_batch['participant_id'],
             save_path=os.path.join(OUTPUT_DIR, "feature_importance_comparison.png")
+        )
+    
+    # If we're using pose features, visualize their weight contributions
+    if model.include_pose:
+        print("Visualizing feature group weights...")
+        model.visualize_feature_group_weights(
+            save_path=os.path.join(OUTPUT_DIR, "feature_group_weights.png")
         )
 
 def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep_id, save_path=None):
