@@ -19,6 +19,41 @@ from model_binary.xlstm import(
     FeedForwardConfig,
 )
 
+class TargetedFeatureDropout(nn.Module):
+    """
+    Applies a higher dropout rate to specific features during training.
+    Unlike standard dropout, this applies a fixed dropout pattern across the sequence
+    for each batch, encouraging the model to rely less on the targeted features.
+    """
+    def __init__(self, dropout_rate=0.5):
+        super(TargetedFeatureDropout, self).__init__()
+        self.dropout_rate = dropout_rate
+        
+    def forward(self, x, training=True):
+        """
+        Apply dropout to input features
+        
+        Args:
+            x: Input features tensor [batch_size, seq_length, feature_dim]
+            training: Whether in training mode (apply dropout) or not
+            
+        Returns:
+            Features with dropout applied
+        """
+        if not training or self.dropout_rate == 0.0:
+            return x
+            
+        # Create a binary mask that's the same across the sequence dimension
+        # This makes certain pose features consistently unavailable for the entire sequence
+        # Shape: [batch_size, 1, feature_dim]
+        batch_size, seq_len, feature_dim = x.shape
+        
+        mask = torch.bernoulli(
+            torch.ones(batch_size, 1, feature_dim, device=x.device) * (1.0 - self.dropout_rate)
+        ).expand(-1, seq_len, -1) / (1.0 - self.dropout_rate)  # Scale to maintain expectation
+            
+        return x * mask
+
 class CNNEncoder(nn.Module):
     """CNN encoder for facial expression features (AUs and gaze)"""
     def __init__(self, input_size, hidden_size, seq_length, dropout=0.5, num_conv_layers=3):
@@ -153,7 +188,7 @@ class xLSTMEncoder(nn.Module):
         return out_seq
 
 class HybridDepBinaryClassifier(nn.Module):
-    def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, seq_length=150,
+    def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, pose_dropout=0.4, seq_length=150,
                  feature_names=None, include_pose=True):
         """
         Hybrid CNN-xLSTM binary classification model for depression detection
@@ -163,6 +198,7 @@ class HybridDepBinaryClassifier(nn.Module):
             hidden_size (int): Hidden state size
             num_layers (int): Number of layers for encoders
             dropout (float): Dropout probability
+            pose_dropout (float): Higher dropout specifically for pose features
             seq_length (int): Length of input sequences
             feature_names (list): Names of input features for interpretability
             include_pose (bool): Whether pose features are included
@@ -173,9 +209,13 @@ class HybridDepBinaryClassifier(nn.Module):
         self.feature_names = feature_names if feature_names else [f"feature_{i}" for i in range(input_size)]
         self.input_size = input_size
         self.include_pose = include_pose
+        self.pose_dropout = pose_dropout
         
         # Create feature group indices
         self.pose_indices, self.gaze_indices, self.au_indices = self._create_feature_group_indices()
+        
+        # Initialize targeted dropout for pose features
+        self.pose_feature_dropout = TargetedFeatureDropout(dropout_rate=pose_dropout)
         
         # If pose features are included, create separate encoders with different architectures
         if include_pose and len(self.pose_indices) > 0:
@@ -202,11 +242,19 @@ class HybridDepBinaryClassifier(nn.Module):
             self.feature_merger = nn.Linear(merged_size, hidden_size)
             self.merger_dropout = nn.Dropout(dropout)
             
-            # Attention layer for combining feature groups
+            # BALANCED FUSION: Create separate projections for each pathway
+            pose_projection_size = hidden_size // 2
+            au_projection_size = hidden_size // 2 + hidden_size // 4
+            
+            # Project both pathways to a common dimension for fair comparison
+            self.pose_projection = nn.Linear(pose_projection_size, hidden_size // 3)
+            self.au_projection = nn.Linear(au_projection_size, hidden_size // 3)
+            
+            # Balanced fusion attention mechanism that uses both pathways
             self.feature_attention = nn.Sequential(
-                nn.Linear(hidden_size // 2, hidden_size // 4),
+                nn.Linear(hidden_size // 3 * 2, hidden_size // 3),  # Combined dimension from both pathways
                 nn.Tanh(),
-                nn.Linear(hidden_size // 4, 2)
+                nn.Linear(hidden_size // 3, 2)  # 2 outputs for the two pathways
             )
         else:
             # If no pose features, use CNN for AU/gaze features only
@@ -309,6 +357,12 @@ class HybridDepBinaryClassifier(nn.Module):
         intermediates = {'input': x, 'au_gaze_features': au_gaze_features}
         
         if self.include_pose and pose_features is not None:
+            # Apply targeted higher dropout to pose features during training
+            # This forces the model to rely less on pose features
+            if self.training and self.pose_dropout > 0:
+                pose_features = self.pose_feature_dropout(pose_features, self.training)
+                intermediates['pose_features_after_dropout'] = pose_features
+            
             # Process pose features with xLSTM (good for temporal dynamics)
             pose_encoded = self.pose_encoder(pose_features)
             
@@ -319,15 +373,23 @@ class HybridDepBinaryClassifier(nn.Module):
             intermediates['pose_encoded'] = pose_encoded
             intermediates['au_gaze_encoded'] = au_gaze_encoded
             
-            # Apply attention to AU/gaze features using CNN's attention
+            # BALANCED FUSION: Get representations from both pathways
+            
+            # Apply attention to AU/gaze features using CNN's attention mechanism
             au_gaze_attended = self.au_encoder.apply_attention(au_gaze_encoded)
             
-            # Use last timestep of pose encoding for additional context
+            # Use last timestep of pose encoding
             pose_attended = pose_encoded[:, -1, :]
             
-            # Apply feature group attention to determine importance of each pathway
-            group_attn_input = pose_attended
-            attention_weights = F.softmax(self.feature_attention(group_attn_input), dim=-1)
+            # Project both attended representations to a common dimension
+            pose_proj = self.pose_projection(pose_attended)
+            au_gaze_proj = self.au_projection(au_gaze_attended)
+            
+            # Combine projections for balanced attention computation
+            combined_proj = torch.cat([pose_proj, au_gaze_proj], dim=1)
+            
+            # Compute balanced attention weights using information from both pathways
+            attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
             self.last_group_attention = attention_weights.detach()
             
             intermediates['group_attention'] = attention_weights

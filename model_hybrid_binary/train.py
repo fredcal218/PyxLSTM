@@ -44,8 +44,9 @@ BATCH_SIZE = 24
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2  # Layers for both CNN and xLSTM paths
 DROPOUT = 0.3
-MAX_SEQ_LENGTH = 450
-LEARNING_RATE = 0.0007  # Compromise between CNN and xLSTM learning rates
+POSE_DROPOUT = 0.99  # Higher dropout specifically for pose features
+MAX_SEQ_LENGTH = 1500
+LEARNING_RATE = 0.0007  
 NUM_EPOCHS = 60
 EARLY_STOPPING_PATIENCE = 15
 INCLUDE_MOVEMENT_FEATURES = True
@@ -65,6 +66,7 @@ config = {
     'hidden_size': HIDDEN_SIZE,
     'num_layers': NUM_LAYERS,
     'dropout': DROPOUT,
+    'pose_dropout': POSE_DROPOUT,
     'max_seq_length': MAX_SEQ_LENGTH,
     'learning_rate': LEARNING_RATE,
     'num_epochs': NUM_EPOCHS,
@@ -114,6 +116,7 @@ def train():
         hidden_size=HIDDEN_SIZE,
         num_layers=NUM_LAYERS,
         dropout=DROPOUT,
+        pose_dropout=POSE_DROPOUT,
         seq_length=MAX_SEQ_LENGTH,
         feature_names=feature_names,
         include_pose=INCLUDE_POSE
