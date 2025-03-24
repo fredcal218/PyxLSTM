@@ -1,0 +1,13 @@
+seed: 42
+batch_size: 24
+hidden_size: 128
+num_layers: 3
+dropout: 0.3
+max_seq_length: 450
+learning_rate: 0.001
+num_epochs: 50
+early_stopping_patience: 15
+include_movement_features: True
+include_pose: False
+model_type: CNN
+device: cuda

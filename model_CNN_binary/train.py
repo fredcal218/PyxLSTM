@@ -42,10 +42,10 @@ print(f"Using device: {device}")
 # Hyperparameters
 BATCH_SIZE = 24
 HIDDEN_SIZE = 128
-NUM_LAYERS = 2
+NUM_LAYERS = 3  # Number of CNN layers (changed from LSTM layers)
 DROPOUT = 0.3
 MAX_SEQ_LENGTH = 450
-LEARNING_RATE = 0.0005
+LEARNING_RATE = 0.001  # Slightly higher for CNN
 NUM_EPOCHS = 50
 EARLY_STOPPING_PATIENCE = 15
 INCLUDE_MOVEMENT_FEATURES = True
@@ -55,7 +55,7 @@ INCLUDE_POSE = False
 DATA_DIR = "E-DAIC/data_extr"
 LABELS_DIR = "E-DAIC/labels"
 timestamp = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
-OUTPUT_DIR = f"model_binary/results/binary_{timestamp}"
+OUTPUT_DIR = f"model_CNN_binary/results/binary_{timestamp}"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configuration logging
@@ -71,6 +71,7 @@ config = {
     'early_stopping_patience': EARLY_STOPPING_PATIENCE,
     'include_movement_features': INCLUDE_MOVEMENT_FEATURES,
     'include_pose': INCLUDE_POSE,
+    'model_type': 'CNN',  # Changed from LSTM
     'device': str(device)
 }
 
@@ -157,7 +158,7 @@ def train():
             optimizer.zero_grad()
             logits = model(features)  # Get logits (no sigmoid)
             
-            # Calculate loss with class weighting (removed pose_Tz regularization)
+            # Calculate loss with class weighting
             loss = criterion(logits, binary_labels)
             
             # Backward pass and optimize
@@ -279,6 +280,7 @@ def train():
     
     return model
 
+# ... existing code for plotting and evaluation functions ...
 def plot_training_history(history):
     """Plot training and validation metrics"""
     plt.figure(figsize=(15, 5))
@@ -496,7 +498,7 @@ def analyze_feature_importance(model, test_loader):
         importance_dict=importance_dict,
         top_k=20,
         save_path=os.path.join(OUTPUT_DIR, "global_feature_importance.png"),
-        title="Global Feature Importance for Depression Detection"
+        title="Global Feature Importance for Depression Detection (CNN Model)"
     )
     
     # Try gradient-based method too for comparison
@@ -506,7 +508,7 @@ def analyze_feature_importance(model, test_loader):
         importance_dict=grad_importance,
         top_k=20,
         save_path=os.path.join(OUTPUT_DIR, "gradient_based_importance.png"),
-        title="Gradient-Based Feature Importance"
+        title="Gradient-Based Feature Importance (CNN Model)"
     )
     
     # Extract and visualize importance of clinically significant AUs
@@ -522,7 +524,7 @@ def analyze_feature_importance(model, test_loader):
     plt.figure(figsize=(10, 6))
     bars = plt.barh(list(clinical_importance.keys()), list(clinical_importance.values()), color='orangered')
     plt.xlabel('Importance Score')
-    plt.title('Importance of Clinically Significant Action Units')
+    plt.title('Importance of Clinically Significant Action Units (CNN Model)')
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, "clinical_au_importance.png"), dpi=300)
     plt.close()
@@ -631,7 +633,7 @@ def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep
     
     plt.yticks(x, all_features)
     plt.xlabel('Feature Importance')
-    plt.title('Feature Importance Comparison: Depressed vs. Non-depressed')
+    plt.title('Feature Importance Comparison: Depressed vs. Non-depressed (CNN Model)')
     
     # Enhance legend with more descriptive labels
     plt.legend(loc='lower right', title='Participant Status')

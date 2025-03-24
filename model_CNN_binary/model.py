@@ -4,78 +4,100 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from xlstm import (
-    xLSTMBlockStack,
-    xLSTMBlockStackConfig,
-    mLSTMBlockConfig,
-    mLSTMLayerConfig,
-    sLSTMBlockConfig,
-    sLSTMLayerConfig,
-    FeedForwardConfig,
-)
 
-class FeatureGroupEncoder(nn.Module):
-    """Encoder for a specific group of features"""
-    def __init__(self, input_size, hidden_size, seq_length, dropout=0.5):
-        super(FeatureGroupEncoder, self).__init__()
+class FeatureGroupCNN(nn.Module):
+    """CNN encoder for a specific group of features"""
+    def __init__(self, input_size, hidden_size, seq_length, dropout=0.5, num_conv_layers=3):
+        super(FeatureGroupCNN, self).__init__()
         
-        # Initial projection
+        # Initial projection to match hidden size
         self.input_proj = nn.Linear(input_size, hidden_size)
         self.input_dropout = nn.Dropout(dropout)
         
-        # xLSTM configuration for this feature group
-        cfg = xLSTMBlockStackConfig(
-            mlstm_block=mLSTMBlockConfig(
-                mlstm=mLSTMLayerConfig(
-                    conv1d_kernel_size=4,
-                    qkv_proj_blocksize=4,
-                    num_heads=4,
-                    dropout=dropout,
-                )
-            ),
-            slstm_block=sLSTMBlockConfig(
-                slstm=sLSTMLayerConfig(
-                    backend="vanilla",
-                    num_heads=4,
-                    conv1d_kernel_size=4,
-                    bias_init="powerlaw_blockdependent",
-                    dropout=dropout,
+        # Create a stack of 1D convolutional layers
+        self.conv_layers = nn.ModuleList()
+        for i in range(num_conv_layers):
+            # Calculate proper padding to maintain sequence length with dilated convolutions
+            dilation = 2**i
+            kernel_size = 3
+            padding = (kernel_size - 1) * dilation // 2
+            
+            # Each layer: conv -> batchnorm -> relu -> dropout
+            conv_layer = nn.Sequential(
+                nn.Conv1d(
+                    in_channels=hidden_size,
+                    out_channels=hidden_size,
+                    kernel_size=kernel_size,
+                    padding=padding,  # Updated to scale with dilation
+                    dilation=dilation
                 ),
-                feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu"),
-            ),
-            context_length=seq_length,
-            num_blocks=1,  # Single block per feature group encoder
-            embedding_dim=hidden_size,
-            slstm_at=[],  # Use mLSTM for simplicity
-            dropout=dropout,
-            bias=True,
+                nn.BatchNorm1d(hidden_size),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+            self.conv_layers.append(conv_layer)
+        
+        # Global attention pooling
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
         )
         
-        self.xlstm_stack = xLSTMBlockStack(cfg)
-        self.xlstm_stack.reset_parameters()
-    
     def forward(self, x):
-        """Forward pass for this feature group"""
-        # Project and apply dropout
-        x_proj = self.input_dropout(self.input_proj(x))
+        """Forward pass
+        Args:
+            x: Input tensor [batch_size, seq_length, input_size]
+        Returns:
+            Processed features [batch_size, seq_length, hidden_size]
+        """
+        batch_size, seq_len, _ = x.shape
         
-        # Process through xLSTM stack
-        out_seq = self.xlstm_stack(x_proj)
+        # Project input to hidden size
+        x_proj = self.input_dropout(self.input_proj(x))  # [batch, seq_len, hidden_size]
         
-        # Return full sequence output
-        return out_seq
+        # Transpose for conv1d: [batch, channels, seq_len]
+        x_conv = x_proj.transpose(1, 2)  # [batch, hidden_size, seq_len]
+        
+        # Apply convolutional layers
+        for conv_layer in self.conv_layers:
+            x_conv = conv_layer(x_conv) + x_conv  # Residual connection
+            
+        # Transpose back to [batch, seq_len, hidden_size]
+        x_out = x_conv.transpose(1, 2)
+        
+        return x_out
+        
+    def apply_attention(self, x):
+        """Apply attention pooling to get sequence representation
+        Args:
+            x: Tensor [batch_size, seq_length, hidden_size]
+        Returns:
+            Pooled representation [batch_size, hidden_size]
+        """
+        # Calculate attention scores
+        attn_scores = self.attention(x).squeeze(-1)  # [batch, seq_len]
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)  # [batch, seq_len, 1]
+        
+        # Store for visualization
+        self.last_attn_weights = attn_weights.detach()
+        
+        # Apply attention weights
+        attended = torch.sum(x * attn_weights, dim=1)  # [batch, hidden_size]
+        
+        return attended
 
 class DepBinaryClassifier(nn.Module):
-    def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, seq_length=150,
+    def __init__(self, input_size=75, hidden_size=128, num_layers=3, dropout=0.5, seq_length=150,
                  feature_names=None, include_pose=True):
         """
         Binary classification model for E-DAIC depression detection with interpretability
-        and separate processing pathways for different feature types.
+        using 1D CNNs instead of LSTM/Transformer.
         
         Args:
             input_size (int): Size of input features
-            hidden_size (int): LSTM hidden state size
-            num_layers (int): Number of LSTM layers
+            hidden_size (int): CNN hidden state size
+            num_layers (int): Number of CNN layers
             dropout (float): Dropout probability
             seq_length (int): Length of input sequences
             feature_names (list): Names of input features for interpretability
@@ -94,18 +116,20 @@ class DepBinaryClassifier(nn.Module):
         # If pose features are included, create separate encoders
         if include_pose and len(self.pose_indices) > 0:
             # Create separate encoders for each feature group
-            self.pose_encoder = FeatureGroupEncoder(
+            self.pose_encoder = FeatureGroupCNN(
                 input_size=len(self.pose_indices),
                 hidden_size=hidden_size // 2,  # Smaller dimension for pose features
                 seq_length=seq_length,
-                dropout=dropout * 1.5  # Higher dropout for pose features to reduce dominance
+                dropout=dropout * 1.5,  # Higher dropout for pose features
+                num_conv_layers=num_layers
             )
             
-            self.au_encoder = FeatureGroupEncoder(
+            self.au_encoder = FeatureGroupCNN(
                 input_size=len(self.au_indices) + len(self.gaze_indices),  # Combine AUs and gaze
                 hidden_size=hidden_size // 2 + hidden_size // 4,  # Larger dimension for AU features
                 seq_length=seq_length,
-                dropout=dropout
+                dropout=dropout,
+                num_conv_layers=num_layers
             )
             
             # Merger for feature group encodings
@@ -117,43 +141,28 @@ class DepBinaryClassifier(nn.Module):
             self.feature_attention = nn.Linear(hidden_size // 2, 2)  # Match the pose encoder dimension
         else:
             # If no pose features, use a single encoder for AUs and gaze
-            self.au_gaze_encoder = FeatureGroupEncoder(
+            self.au_gaze_encoder = FeatureGroupCNN(
                 input_size=len(self.au_indices) + len(self.gaze_indices),
                 hidden_size=hidden_size,
                 seq_length=seq_length,
-                dropout=dropout
+                dropout=dropout,
+                num_conv_layers=num_layers
             )
         
-        # Final xLSTM for sequence processing
-        cfg = xLSTMBlockStackConfig(
-            mlstm_block=mLSTMBlockConfig(
-                mlstm=mLSTMLayerConfig(
-                    conv1d_kernel_size=4,
-                    qkv_proj_blocksize=4,
-                    num_heads=4,
-                    dropout=dropout,
-                )
-            ),
-            slstm_block=sLSTMBlockConfig(
-                slstm=sLSTMLayerConfig(
-                    backend="vanilla",
-                    num_heads=4,
-                    conv1d_kernel_size=4,
-                    bias_init="powerlaw_blockdependent",
-                    dropout=dropout,
-                ),
-                feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu"),
-            ),
-            context_length=seq_length,
-            num_blocks=1 if include_pose else num_layers,  # Only one layer if using separate encoders
-            embedding_dim=hidden_size,
-            slstm_at=[0],  # Use sLSTM for first layer
-            dropout=dropout,
-            bias=True,
+        # Final sequence model: a stack of 1D CNN layers with global pooling
+        self.feature_pooling = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size)
         )
         
-        self.xlstm_stack = xLSTMBlockStack(cfg)
-        self.xlstm_stack.reset_parameters()
+        # Global attention pooling
+        self.global_attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(), 
+            nn.Linear(hidden_size // 2, 1)
+        )
         
         # Output layer for binary classification
         self.fc = nn.Linear(hidden_size, 1)
@@ -223,16 +232,6 @@ class DepBinaryClassifier(nn.Module):
         # x shape: [batch, seq_length, input_size]
         batch_size, seq_len, _ = x.shape
         
-        # Ensure input dimensions match expected dimensions
-        if seq_len > self.xlstm_stack.config.context_length:
-            x = x[:, :self.xlstm_stack.config.context_length, :]
-        elif seq_len < self.xlstm_stack.config.context_length:
-            padding = torch.zeros(batch_size, 
-                                 self.xlstm_stack.config.context_length - seq_len, 
-                                 x.shape[-1], 
-                                 device=x.device)
-            x = torch.cat([x, padding], dim=1)
-        
         # Split features into groups
         pose_features, au_gaze_features = self._split_features(x)
         
@@ -247,9 +246,14 @@ class DepBinaryClassifier(nn.Module):
             intermediates['pose_encoded'] = pose_encoded
             intermediates['au_gaze_encoded'] = au_gaze_encoded
             
-            # Apply attention to feature group outputs
-            last_pose = pose_encoded[:, -1, :]  # Shape: [batch_size, hidden_size/2]
-            attention_weights = F.softmax(self.feature_attention(last_pose), dim=-1)
+            # Apply attention to pose features
+            pose_attended = self.pose_encoder.apply_attention(pose_encoded)
+            
+            # Apply attention to AU/gaze features
+            au_gaze_attended = self.au_encoder.apply_attention(au_gaze_encoded)
+            
+            # Apply feature attention to combine groups
+            attention_weights = F.softmax(self.feature_attention(pose_attended), dim=-1)
             self.last_group_attention = attention_weights.detach()
             
             intermediates['group_attention'] = attention_weights
@@ -260,20 +264,34 @@ class DepBinaryClassifier(nn.Module):
             
             intermediates['merged'] = merged
             
-            # Process through final xLSTM stack
-            out_seq = self.xlstm_stack(merged)
+            # Apply global attention pooling
+            attn_scores = self.global_attention(merged).squeeze(-1)
+            attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)
+            self.last_attention_weights = attn_weights.detach()
+            
+            out_seq = merged
+            pooled = torch.sum(out_seq * attn_weights, dim=1)
+            
         else:
-            # If no pose features, just use the AU/gaze encoder directly
+            # If no pose features, process through the AU/gaze encoder
             out_seq = self.au_gaze_encoder(au_gaze_features)
+            
+            # Apply global attention pooling
+            attn_scores = self.global_attention(out_seq).squeeze(-1)
+            attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)
+            self.last_attention_weights = attn_weights.detach()
+            
+            pooled = torch.sum(out_seq * attn_weights, dim=1)
         
         intermediates['sequence_out'] = out_seq
+        intermediates['attention_weights'] = attn_weights
         
-        # Use the last timestep for classification
-        out_last = out_seq[:, -1, :]
-        out_last = self.dropout(out_last)
-        logits = self.fc(out_last)
+        # Apply feature pooling and final classification
+        out_features = self.feature_pooling(pooled)
+        out_features = self.dropout(out_features)
+        logits = self.fc(out_features)
         
-        intermediates['final_out'] = out_last
+        intermediates['final_out'] = out_features
         
         # Return raw logits (no sigmoid) for use with BCEWithLogitsLoss
         if return_intermediates:
@@ -330,39 +348,27 @@ class DepBinaryClassifier(nn.Module):
     
     def get_attention_weights(self):
         """
-        Extract attention weights from the xLSTM model
+        Extract attention weights from the model
         
         Returns:
             list: Attention weights from each layer
         """
         attention_weights = []
         
-        # Extract feature group attention
+        # Extract feature group attention if available
         if hasattr(self, 'last_group_attention'):
             attention_weights.append({
                 'layer': 'feature_group_attention',
                 'weights': self.last_group_attention
             })
         
-        # Extract attention weights from mLSTM and sLSTM layers
-        for block_idx, block in enumerate(self.xlstm_stack.blocks):
-            # Check if the block has mlstm
-            if hasattr(block, 'mlstm') and hasattr(block.mlstm, 'attn'):
-                if hasattr(block.mlstm.attn, 'last_attn_weights'):
-                    attention_weights.append({
-                        'layer': f'block_{block_idx}_mlstm',
-                        'weights': block.mlstm.attn.last_attn_weights.detach()
-                    })
-            
-            # Check if the block has slstm
-            if hasattr(block, 'slstm') and hasattr(block.slstm, 'attn'):
-                if hasattr(block.slstm.attn, 'last_attn_weights'):
-                    attention_weights.append({
-                        'layer': f'block_{block_idx}_slstm',
-                        'weights': block.slstm.attn.last_attn_weights.detach()
-                    })
+        # Extract global attention weights if available
+        if hasattr(self, 'last_attention_weights'):
+            attention_weights.append({
+                'layer': 'global_attention',
+                'weights': self.last_attention_weights
+            })
         
-        self.last_attention_weights = attention_weights
         return attention_weights
     
     def gradient_feature_importance(self, x, target_class=1):
@@ -628,49 +634,40 @@ class DepBinaryClassifier(nn.Module):
         
         return plt.gcf()
     
-    def visualize_attention(self, layer_idx=0, head_idx=0, save_path=None):
+    def visualize_attention(self, layer_idx=0, save_path=None):
         """
-        Visualize attention weights from a specific layer and head
+        Visualize attention weights
         
         Args:
             layer_idx (int): Index of the layer to visualize
-            head_idx (int): Index of the attention head to visualize
             save_path (str): Path to save visualization
             
         Returns:
             matplotlib.figure.Figure: Attention visualization
         """
-        if self.last_attention_weights is None:
-            raise ValueError("No attention weights available. Run get_attention_weights() first.")
+        attention_weights = self.get_attention_weights()
         
-        if layer_idx >= len(self.last_attention_weights):
-            raise ValueError(f"Layer index {layer_idx} out of range. Only {len(self.last_attention_weights)} layers available.")
+        if not attention_weights:
+            raise ValueError("No attention weights available. Run forward pass first.")
+            
+        if layer_idx >= len(attention_weights):
+            raise ValueError(f"Layer index {layer_idx} out of range")
+            
+        # Extract weights from specified layer
+        layer_name = attention_weights[layer_idx]['layer']
+        weights = attention_weights[layer_idx]['weights']
         
-        # Get attention weights for the specified layer
-        layer_info = self.last_attention_weights[layer_idx]
-        layer_name = layer_info['layer']
-        attn_weights = layer_info['weights']
-        
-        # For multi-head attention, select the head
-        if len(attn_weights.shape) == 4:  # [batch, heads, seq, seq]
-            if head_idx >= attn_weights.shape[1]:
-                raise ValueError(f"Head index {head_idx} out of range. Only {attn_weights.shape[1]} heads available.")
-            # Select head and average over batch
-            attn_weights = attn_weights[:, head_idx].mean(0)
-        else:
-            # Average over batch
-            attn_weights = attn_weights.mean(0)
-        
-        # Create heatmap visualization
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(attn_weights.cpu().numpy(), cmap='viridis')
-        plt.title(f'Attention Weights: {layer_name}, Head {head_idx}')
-        plt.xlabel('Key Position')
-        plt.ylabel('Query Position')
+        # Visualize attention weights
+        plt.figure(figsize=(10, 6))
+        plt.imshow(weights.cpu().numpy().squeeze(), aspect='auto', cmap='viridis')
+        plt.colorbar(label='Attention Weight')
+        plt.title(f'Attention Weights: {layer_name}')
+        plt.xlabel('Feature Dimension')
+        plt.ylabel('Sequence Position')
         plt.tight_layout()
         
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.savefig(save_path, dpi=300)
         
         return plt.gcf()
     
