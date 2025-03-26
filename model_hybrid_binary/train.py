@@ -13,6 +13,7 @@ from tqdm import tqdm
 import time
 from datetime import datetime
 import json
+import math
 
 from model import HybridDepBinaryClassifier
 from data_processor import get_dataloaders
@@ -43,18 +44,23 @@ print(f"Using device: {device}")
 BATCH_SIZE = 24
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2  # Layers for both CNN and xLSTM paths
-DROPOUT = 0.4
-POSE_DROPOUT = 0.4  
-AUDIO_DROPOUT = 0.4  
+DROPOUT = 0.5    # Increased from 0.4 for more regularization
+POSE_DROPOUT = 0.9  # Increased from 0.6 to reduce pose feature dominance  
+AUDIO_DROPOUT = 0.5  # Increased from 0.4 for more regularization
 MAX_SEQ_LENGTH = 450
-LEARNING_RATE = 0.005  
-NUM_EPOCHS = 100
-EARLY_STOPPING_PATIENCE = 15
+LEARNING_RATE = 0.00003  # Decreased from 0.0005 for more stable optimization
+WEIGHT_DECAY = 0.02    # Increased from 0.01 for stronger regularization
+NUM_EPOCHS = 150        # Increased to allow more time to find optimal weights
+EARLY_STOPPING_PATIENCE = 20  # Increased from 15
+EARLY_STOPPING_MIN_DELTA = 0.005  # Minimum improvement required
+WARMUP_EPOCHS = 10       # Number of epochs for learning rate warm-up
+LR_SCHEDULER_FACTOR = 0.7  # Less aggressive reduction (was 0.5) 
+LR_SCHEDULER_PATIENCE = 7  # Increased patience before reducing LR
 INCLUDE_MOVEMENT_FEATURES = True
 INCLUDE_POSE = True
 INCLUDE_AUDIO = True  
 USE_HYBRID_PATHWAYS = True
-# New fusion type parameter - options: "attention" (original), "cross_modal"
+# Fusion type parameter - options: "attention" (original), "cross_modal"
 FUSION_TYPE = "cross_modal"
 
 # Directories
@@ -75,8 +81,13 @@ config = {
     'audio_dropout': AUDIO_DROPOUT,
     'max_seq_length': MAX_SEQ_LENGTH,
     'learning_rate': LEARNING_RATE,
+    'weight_decay': WEIGHT_DECAY,
     'num_epochs': NUM_EPOCHS,
     'early_stopping_patience': EARLY_STOPPING_PATIENCE,
+    'early_stopping_min_delta': EARLY_STOPPING_MIN_DELTA,
+    'warmup_epochs': WARMUP_EPOCHS,
+    'lr_scheduler_factor': LR_SCHEDULER_FACTOR,
+    'lr_scheduler_patience': LR_SCHEDULER_PATIENCE,
     'include_movement_features': INCLUDE_MOVEMENT_FEATURES,
     'include_pose': INCLUDE_POSE,
     'include_audio': INCLUDE_AUDIO,
@@ -196,6 +207,82 @@ def optimize_threshold(model, dev_loader):
     
     return optimal_threshold
 
+# Custom learning rate scheduler with warm-up
+class WarmupScheduler:
+    """
+    Custom scheduler implementing warm-up followed by ReduceLROnPlateau behavior
+    
+    During warm-up phase, LR increases linearly from 10% to 100% of target LR.
+    After warm-up, behaves like ReduceLROnPlateau, reducing LR when improvements plateau.
+    """
+    def __init__(self, optimizer, warmup_epochs, base_lr, factor=0.7, patience=7, 
+                 min_lr=1e-6, verbose=False):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = base_lr
+        self.factor = factor
+        self.patience = patience
+        self.min_lr = min_lr
+        self.verbose = verbose
+        
+        # For plateau detection
+        self.best_score = -float('inf')
+        self.bad_epochs = 0
+        self.last_epoch = -1
+        
+        # For warm-up phase - start at 10% of base LR
+        self._set_lr(base_lr * 0.1)
+    
+    def _set_lr(self, lr):
+        """Set learning rate for all parameter groups"""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = max(lr, self.min_lr)  # Ensure LR doesn't go below minimum
+    
+    def step(self, epoch, val_metric=None):
+        """Update learning rate based on epoch and validation metric"""
+        self.last_epoch = epoch
+        
+        # Warm-up phase: linear increase from 10% to 100% of base LR
+        if epoch < self.warmup_epochs:
+            progress = epoch / self.warmup_epochs
+            lr = self.base_lr * (0.1 + 0.9 * progress)  # Linear warm-up
+            self._set_lr(lr)
+            
+            if self.verbose:
+                print(f"Warm-up LR: {lr:.6f} ({progress*100:.1f}% of warm-up complete)")
+            return
+        
+        # After warm-up: use ReduceLROnPlateau behavior
+        if val_metric is None:
+            return  # No metric provided, keep current LR
+        
+        # Check if validation metric improved
+        if val_metric > self.best_score + 1e-4:  # Small threshold for numerical stability
+            improvement = val_metric - self.best_score
+            self.best_score = val_metric
+            self.bad_epochs = 0
+            
+            if self.verbose and epoch >= self.warmup_epochs:
+                print(f"Validation metric improved by {improvement:.4f}, resetting patience")
+        else:
+            self.bad_epochs += 1
+            
+            if self.verbose:
+                print(f"Validation metric did not improve. Patience: {self.bad_epochs}/{self.patience}")
+            
+            # If patience is exhausted, reduce learning rate
+            if self.bad_epochs >= self.patience:
+                for param_group in self.optimizer.param_groups:
+                    old_lr = param_group['lr']
+                    new_lr = max(old_lr * self.factor, self.min_lr)
+                    param_group['lr'] = new_lr
+                
+                # Reset patience counter
+                self.bad_epochs = 0
+                
+                if self.verbose:
+                    print(f"Reducing learning rate from {old_lr:.6f} to {new_lr:.6f}")
+
 def train():
     # Get dataloaders
     data = get_dataloaders(
@@ -252,12 +339,17 @@ def train():
     # Define loss function with class weighting
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
-    # Use AdamW optimizer which can handle both CNN and RNN components better
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+    # Use AdamW optimizer with higher weight decay
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+    # Use custom learning rate scheduler with warm-up
+    scheduler = WarmupScheduler(
+        optimizer=optimizer,
+        warmup_epochs=WARMUP_EPOCHS,
+        base_lr=LEARNING_RATE,
+        factor=LR_SCHEDULER_FACTOR,
+        patience=LR_SCHEDULER_PATIENCE,
+        verbose=True
     )
     
     # For early stopping - initialize to negative value so first epoch always improves
@@ -304,8 +396,8 @@ def train():
             # Backward pass and optimize
             loss.backward()
             
-            # Gradient clipping to prevent exploding gradients (important for RNNs)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # More aggressive gradient clipping to stabilize training
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Reduced from 1.0
             
             optimizer.step()
             
@@ -361,8 +453,8 @@ def train():
         history['val_acc'].append(val_metrics['accuracy'])
         history['val_f1'].append(val_metrics['f1'])
         
-        # Update learning rate based on validation F1
-        scheduler.step(val_metrics['f1'])
+        # Update learning rate using our custom scheduler
+        scheduler.step(epoch, val_metrics['f1'])
         
         # Calculate epoch time
         epoch_time = time.time() - start_time
@@ -374,7 +466,7 @@ def train():
         print(f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Check if this is the best model so far
-        is_best_model = val_metrics['f1'] > best_val_f1
+        is_best_model = val_metrics['f1'] > best_val_f1 + EARLY_STOPPING_MIN_DELTA
         
         # Save epoch metrics to CSV
         epoch_metrics = {
@@ -405,6 +497,7 @@ def train():
         
         # Check for improvement
         if is_best_model:
+            improvement_amount = val_metrics['f1'] - best_val_f1
             best_val_f1 = val_metrics['f1']
             patience_counter = 0
             
@@ -437,12 +530,12 @@ def train():
             with open(metrics_path, 'w') as f:
                 json.dump(metrics_json, f, indent=4)
             
-            print(f"  Model improved! Saved checkpoint and metrics to {metrics_path}")
+            print(f"  Model improved by {improvement_amount:.4f}! Saved checkpoint and metrics to {metrics_path}")
         else:
             patience_counter += 1
-            print(f"  No improvement. Patience: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
+            print(f"  No significant improvement. Patience: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
             if patience_counter >= EARLY_STOPPING_PATIENCE:
-                print("Early stopping!")
+                print("Early stopping! No significant improvement for {EARLY_STOPPING_PATIENCE} epochs")
                 break
     
     # Save final model

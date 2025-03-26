@@ -707,13 +707,51 @@ class HybridDepBinaryClassifier(nn.Module):
                     
                     # Merge all three enhanced encodings
                     merged = torch.cat([pose_enhanced, au_gaze_enhanced, audio_enhanced], dim=2)
+                    
+                    # Calculate modality importance weights for cross-modal fusion
+                    # First get a summarized representation of each modality
+                    pose_summary = torch.mean(pose_enhanced, dim=1)  # [batch, hidden_size]
+                    au_gaze_summary = torch.mean(au_gaze_enhanced, dim=1)  # [batch, hidden_size]
+                    audio_summary = torch.mean(audio_enhanced, dim=1)  # [batch, hidden_size]
+                    
+                    # Normalize each summary to unit length
+                    pose_norm = F.normalize(pose_summary, p=2, dim=1)
+                    au_gaze_norm = F.normalize(au_gaze_summary, p=2, dim=1)
+                    audio_norm = F.normalize(audio_summary, p=2, dim=1)
+                    
+                    # Calculate L2 norm of each summary as a proxy for importance
+                    pose_importance = torch.norm(pose_summary, p=2, dim=1, keepdim=True)
+                    au_gaze_importance = torch.norm(au_gaze_summary, p=2, dim=1, keepdim=True)
+                    audio_importance = torch.norm(audio_summary, p=2, dim=1, keepdim=True)
+                    
+                    # Stack importances and normalize with softmax to get weights
+                    modality_importances = torch.cat([pose_importance, au_gaze_importance, audio_importance], dim=1)
+                    modality_weights = F.softmax(modality_importances, dim=1)
+                    
+                    # Store for visualization/analysis
+                    self.last_modality_weights = modality_weights.detach()
+                    
                 else:
                     # Merge the two enhanced encodings
                     merged = torch.cat([pose_enhanced, au_gaze_enhanced], dim=2)
+                    
+                    # Calculate modality importance weights for two modalities
+                    pose_summary = torch.mean(pose_enhanced, dim=1)  # [batch, hidden_size]
+                    au_gaze_summary = torch.mean(au_gaze_enhanced, dim=1)  # [batch, hidden_size]
+                    
+                    pose_importance = torch.norm(pose_summary, p=2, dim=1, keepdim=True)
+                    au_gaze_importance = torch.norm(au_gaze_summary, p=2, dim=1, keepdim=True)
+                    
+                    modality_importances = torch.cat([pose_importance, au_gaze_importance], dim=1)
+                    modality_weights = F.softmax(modality_importances, dim=1)
+                    
+                    # Store for visualization/analysis
+                    self.last_modality_weights = modality_weights.detach()
                 
                 # Apply merger
                 merged = self.merger_dropout(self.feature_merger(merged))
                 intermediates['merged'] = merged
+                intermediates['modality_weights'] = self.last_modality_weights
             else:
                 # Original attention-based fusion
                 # BALANCED FUSION: Get representations from all pathways
@@ -1327,9 +1365,8 @@ class HybridDepBinaryClassifier(nn.Module):
         clinical_importance = {}
         for i, feature_name in enumerate(self.feature_names):
             for au_code, au_name in clinical_aus.items():
-                if au_code in feature_name:
-                    if i < len(importance_array):
-                        clinical_importance[f"{au_code} ({au_name})"] = importance_array[i]
+                if (au_code in feature_name) and (i < len(importance_array)):
+                    clinical_importance[f"{au_code} ({au_name})"] = importance_array[i]
         
         # Sort by importance
         clinical_importance = {k: v for k, v in 
