@@ -44,13 +44,16 @@ BATCH_SIZE = 24
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2  # Layers for both CNN and xLSTM paths
 DROPOUT = 0.3
-POSE_DROPOUT = 0.99  # Higher dropout specifically for pose features
-MAX_SEQ_LENGTH = 1500
-LEARNING_RATE = 0.0007  
+POSE_DROPOUT = 0.4  
+AUDIO_DROPOUT = 0.3  # New parameter for audio dropout
+MAX_SEQ_LENGTH = 450
+LEARNING_RATE = 0.005  
 NUM_EPOCHS = 60
-EARLY_STOPPING_PATIENCE = 15
+EARLY_STOPPING_PATIENCE = 10
 INCLUDE_MOVEMENT_FEATURES = True
-INCLUDE_POSE = True  # Must be True for the hybrid model to work with both pathways
+INCLUDE_POSE = False
+INCLUDE_AUDIO = True  # Enable audio features
+USE_HYBRID_PATHWAYS = True  # Whether to use all pathways
 
 # Directories
 DATA_DIR = "E-DAIC/data_extr"
@@ -67,13 +70,16 @@ config = {
     'num_layers': NUM_LAYERS,
     'dropout': DROPOUT,
     'pose_dropout': POSE_DROPOUT,
+    'audio_dropout': AUDIO_DROPOUT,
     'max_seq_length': MAX_SEQ_LENGTH,
     'learning_rate': LEARNING_RATE,
     'num_epochs': NUM_EPOCHS,
     'early_stopping_patience': EARLY_STOPPING_PATIENCE,
     'include_movement_features': INCLUDE_MOVEMENT_FEATURES,
     'include_pose': INCLUDE_POSE,
-    'model_type': 'Hybrid CNN-xLSTM',
+    'include_audio': INCLUDE_AUDIO,
+    'use_hybrid_pathways': USE_HYBRID_PATHWAYS,
+    'model_type': 'Hybrid CNN-xLSTM-Audio',
     'device': str(device)
 }
 
@@ -90,7 +96,8 @@ def train():
         batch_size=BATCH_SIZE,
         max_seq_length=MAX_SEQ_LENGTH,
         include_movement_features=INCLUDE_MOVEMENT_FEATURES,
-        include_pose=INCLUDE_POSE  # Must include pose for hybrid model
+        include_pose=INCLUDE_POSE,
+        include_audio=INCLUDE_AUDIO  # Pass audio flag to data processor
     )
     
     # Extract loaders and datasets
@@ -105,10 +112,14 @@ def train():
         sample_batch = next(iter(train_loader))
         input_size = sample_batch['features'].shape[2]
         feature_names = train_dataset.get_feature_names()
+        
+        # Get audio feature names if available
+        audio_feature_names = train_dataset.get_audio_feature_names() if INCLUDE_AUDIO else []
     else:
         # Default values if dataset is empty
         input_size = 75
         feature_names = [f"feature_{i}" for i in range(input_size)]
+        audio_feature_names = []
     
     # Initialize model
     model = HybridDepBinaryClassifier(
@@ -117,9 +128,13 @@ def train():
         num_layers=NUM_LAYERS,
         dropout=DROPOUT,
         pose_dropout=POSE_DROPOUT,
+        audio_dropout=AUDIO_DROPOUT,
         seq_length=MAX_SEQ_LENGTH,
         feature_names=feature_names,
-        include_pose=INCLUDE_POSE
+        audio_feature_names=audio_feature_names,
+        include_pose=INCLUDE_POSE,
+        include_audio=INCLUDE_AUDIO,
+        use_hybrid_pathways=USE_HYBRID_PATHWAYS
     ).to(device)
     
     # Calculate class weights based on class distribution (24% depressed, 76% non-depressed)
@@ -151,6 +166,9 @@ def train():
         'learning_rates': []
     }
     
+    # Create history CSV file path
+    history_csv_path = os.path.join(OUTPUT_DIR, "training_history.csv")
+    
     # Training loop
     for epoch in range(NUM_EPOCHS):
         start_time = time.time()
@@ -164,9 +182,12 @@ def train():
             features = batch['features'].to(device)
             binary_labels = batch['binary_label'].to(device)
             
+            # Get audio features if available
+            audio_features = batch['audio_features'].to(device) if 'audio_features' in batch else None
+            
             # Forward pass
             optimizer.zero_grad()
-            logits = model(features)  # Get logits (no sigmoid)
+            logits = model(features, audio_features)  # Pass audio features to model
             
             # Calculate loss with class weighting
             loss = criterion(logits, binary_labels)
@@ -206,8 +227,11 @@ def train():
                 features = batch['features'].to(device)
                 binary_labels = batch['binary_label'].to(device)
                 
+                # Get audio features if available
+                audio_features = batch['audio_features'].to(device) if 'audio_features' in batch else None
+                
                 # Forward pass
-                logits = model(features)  # Get logits
+                logits = model(features, audio_features)  # Pass audio features to model
                 
                 # Calculate loss
                 loss = criterion(logits, binary_labels)
@@ -240,8 +264,38 @@ def train():
         print(f"  Val Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']:.4f}, F1: {val_metrics['f1']:.4f}")
         print(f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         
+        # Check if this is the best model so far
+        is_best_model = val_metrics['f1'] > best_val_f1
+        
+        # Save epoch metrics to CSV
+        epoch_metrics = {
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'train_accuracy': train_metrics['accuracy'],
+            'train_precision': train_metrics['precision'],
+            'train_recall': train_metrics['recall'],
+            'train_f1': train_metrics['f1'],
+            'val_loss': val_loss,
+            'val_accuracy': val_metrics['accuracy'],
+            'val_precision': val_metrics['precision'],
+            'val_recall': val_metrics['recall'],
+            'val_f1': val_metrics['f1'],
+            'learning_rate': optimizer.param_groups[0]['lr'],
+            'epoch_time_seconds': epoch_time,
+            'best_model': is_best_model  # Add indicator for best model
+        }
+        
+        # Convert to DataFrame
+        epoch_df = pd.DataFrame([epoch_metrics])
+        
+        # If first epoch, create new file with header, otherwise append without header
+        if epoch == 0:
+            epoch_df.to_csv(history_csv_path, mode='w', index=False)
+        else:
+            epoch_df.to_csv(history_csv_path, mode='a', header=False, index=False)
+        
         # Check for improvement
-        if val_metrics['f1'] > best_val_f1:
+        if is_best_model:
             best_val_f1 = val_metrics['f1']
             patience_counter = 0
             
@@ -349,7 +403,7 @@ def evaluate_model(model, test_loader):
     all_logits = []
     all_labels = []
     all_participant_ids = []
-    all_phq_scores = []  # Only include if PHQ scores are available
+    all_phq_scores = []
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating on test set"):
@@ -357,9 +411,12 @@ def evaluate_model(model, test_loader):
             binary_labels = batch['binary_label']
             participant_ids = batch['participant_id']
             
+            # Get audio features if available
+            audio_features = batch['audio_features'].to(device) if 'audio_features' in batch else None
+            
             # Forward pass
-            logits = model(features)
-            probs = torch.sigmoid(logits)  # Convert to probabilities
+            logits = model(features, audio_features)  # Pass audio features
+            probs = torch.sigmoid(logits)
             
             # Collect results
             all_logits.extend(logits.cpu().numpy())
@@ -498,7 +555,7 @@ def analyze_feature_importance(model, test_loader):
     # Get a batch of test data
     batch = next(iter(test_loader))
     features = batch['features'].to(device)
-    labels = batch['binary_label'].to(device)
+    audio_features = batch['audio_features'].to(device) if 'audio_features' in batch else None
     
     print("Analyzing feature importance...")
     print(f"Feature batch shape: {features.shape}")
@@ -514,7 +571,11 @@ def analyze_feature_importance(model, test_loader):
     
     # Calculate global feature importance using integrated gradients
     print("Calculating integrated gradients (this may take a moment)...")
-    importance_dict = model.integrated_gradients(single_example, steps=20)  # Fewer steps for debugging
+    importance_dict = model.integrated_gradients(
+        features[0:1],  # Use single example
+        audio_features=audio_features[0:1] if audio_features is not None else None,
+        steps=20
+    )
     
     # Print importance stats
     importance_values = list(importance_dict.values())
@@ -526,8 +587,48 @@ def analyze_feature_importance(model, test_loader):
         importance_dict=importance_dict,
         top_k=20,
         save_path=os.path.join(OUTPUT_DIR, "global_feature_importance.png"),
-        title="Global Feature Importance for Depression Detection (CNN Model)"
+        title="Global Feature Importance for Depression Detection (Hybrid Model)",
+        highlight_audio=True
     )
+    
+    # If we have audio features, generate audio-specific visualization
+    if audio_features is not None:
+        audio_importance = model.get_audio_feature_importance()
+        if audio_importance:
+            # Sort by importance
+            audio_importance = {k: v for k, v in 
+                              sorted(audio_importance.items(), 
+                                    key=lambda item: item[1], 
+                                    reverse=True)}
+            
+            # Plot top audio features
+            plt.figure(figsize=(12, 8))
+            plt.barh(list(audio_importance.keys())[:15], 
+                     list(audio_importance.values())[:15], 
+                     color='purple')
+            plt.xlabel('Importance')
+            plt.title('Top Audio Features for Depression Detection')
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, "audio_feature_importance.png"), dpi=300)
+            plt.close()
+    
+    # Get modality importance if available
+    modality_importance = model.get_modality_importance()
+    if modality_importance:
+        # Plot modality importance
+        plt.figure(figsize=(8, 6))
+        plt.bar(modality_importance.keys(), modality_importance.values(), color=['green', 'blue', 'purple'])
+        plt.xlabel('Modality')
+        plt.ylabel('Relative Importance')
+        plt.title('Relative Importance of Different Modalities')
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "modality_importance.png"), dpi=300)
+        plt.close()
+        
+        # Save modality importance to file
+        with open(os.path.join(OUTPUT_DIR, "modality_importance.json"), 'w') as f:
+            import json
+            json.dump(modality_importance, f, indent=4)
     
     # Try gradient-based method too for comparison
     print("Calculating gradient-based importance...")

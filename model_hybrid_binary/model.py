@@ -187,84 +187,236 @@ class xLSTMEncoder(nn.Module):
         # Return full sequence output
         return out_seq
 
-class HybridDepBinaryClassifier(nn.Module):
-    def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, pose_dropout=0.4, seq_length=150,
-                 feature_names=None, include_pose=True):
+class AudioEncoder(nn.Module):
+    """xLSTM encoder for audio features"""
+    def __init__(self, input_size, hidden_size, seq_length, dropout=0.5, num_blocks=1):
+        super(AudioEncoder, self).__init__()
+        
+        # Initial projection
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        self.input_dropout = nn.Dropout(dropout)
+        
+        # xLSTM configuration
+        cfg = xLSTMBlockStackConfig(
+            mlstm_block=mLSTMBlockConfig(
+                mlstm=mLSTMLayerConfig(
+                    conv1d_kernel_size=4,
+                    qkv_proj_blocksize=4,
+                    num_heads=4,
+                    dropout=dropout,
+                )
+            ),
+            slstm_block=sLSTMBlockConfig(
+                slstm=sLSTMLayerConfig(
+                    backend="vanilla",
+                    num_heads=4,
+                    conv1d_kernel_size=4,
+                    bias_init="powerlaw_blockdependent",
+                    dropout=dropout,
+                ),
+                feedforward=FeedForwardConfig(proj_factor=1.3, act_fn="gelu"),
+            ),
+            context_length=seq_length,
+            num_blocks=num_blocks,
+            embedding_dim=hidden_size,
+            slstm_at=[],  # Use mLSTM for simplicity
+            dropout=dropout,
+            bias=True,
+        )
+        
+        self.xlstm_stack = xLSTMBlockStack(cfg)
+        self.xlstm_stack.reset_parameters()
+        
+        # Add global attention mechanism for sequence pooling
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+    
+    def forward(self, x):
+        """Forward pass for xLSTM encoder"""
+        # Project and apply dropout
+        x_proj = self.input_dropout(self.input_proj(x))
+        
+        # Process through xLSTM stack
+        out_seq = self.xlstm_stack(x_proj)
+        
+        # Return full sequence output
+        return out_seq
+    
+    def apply_attention(self, x):
+        """Apply attention pooling to get sequence representation
+        Args:
+            x: Tensor [batch_size, seq_length, hidden_size]
+        Returns:
+            Pooled representation [batch_size, hidden_size]
         """
-        Hybrid CNN-xLSTM binary classification model for depression detection
+        # Calculate attention scores
+        attn_scores = self.attention(x).squeeze(-1)  # [batch, seq_len]
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)  # [batch, seq_len, 1]
+        
+        # Store for visualization
+        self.last_attn_weights = attn_weights.detach()
+        
+        # Apply attention weights
+        attended = torch.sum(x * attn_weights, dim=1)  # [batch, hidden_size]
+        
+        return attended
+
+class HybridDepBinaryClassifier(nn.Module):
+    def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, pose_dropout=0.4, 
+                 audio_dropout=0.3, seq_length=150, feature_names=None, audio_feature_names=None,
+                 include_pose=True, include_audio=True, use_hybrid_pathways=True):
+        """
+        Hybrid CNN-xLSTM-Audio model for depression detection
         
         Args:
-            input_size (int): Size of input features
+            input_size (int): Size of visual input features
             hidden_size (int): Hidden state size
             num_layers (int): Number of layers for encoders
             dropout (float): Dropout probability
             pose_dropout (float): Higher dropout specifically for pose features
+            audio_dropout (float): Dropout for audio features
             seq_length (int): Length of input sequences
-            feature_names (list): Names of input features for interpretability
+            feature_names (list): Names of visual input features for interpretability
+            audio_feature_names (list): Names of audio features for interpretability
             include_pose (bool): Whether pose features are included
+            include_audio (bool): Whether audio features are included
+            use_hybrid_pathways (bool): Whether to use multiple pathways regardless of feature types
         """
         super(HybridDepBinaryClassifier, self).__init__()
 
         # Store feature names for interpretability
         self.feature_names = feature_names if feature_names else [f"feature_{i}" for i in range(input_size)]
+        self.audio_feature_names = audio_feature_names if audio_feature_names else []
         self.input_size = input_size
+        self.audio_input_size = len(self.audio_feature_names) if self.audio_feature_names else 0
         self.include_pose = include_pose
+        self.include_audio = include_audio
         self.pose_dropout = pose_dropout
+        self.audio_dropout = audio_dropout
+        self.use_hybrid_pathways = use_hybrid_pathways
         
         # Create feature group indices
         self.pose_indices, self.gaze_indices, self.au_indices = self._create_feature_group_indices()
         
-        # Initialize targeted dropout for pose features
+        # Initialize targeted dropout for pose and audio features
         self.pose_feature_dropout = TargetedFeatureDropout(dropout_rate=pose_dropout)
+        self.audio_feature_dropout = TargetedFeatureDropout(dropout_rate=audio_dropout)
         
-        # If pose features are included, create separate encoders with different architectures
-        if include_pose and len(self.pose_indices) > 0:
-            # Use xLSTM for pose features (better at temporal dynamics)
+        # Create pathways based on enabled features
+        if self.use_hybrid_pathways:
+            # Determine input sizes based on available features
+            if include_pose and len(self.pose_indices) > 0:
+                # When pose is included, use pose for xLSTM
+                pose_input_size = len(self.pose_indices)
+                # Use AU/gaze for CNN
+                cnn_input_size = len(self.au_indices) + len(self.gaze_indices)
+            else:
+                # When pose is excluded, distribute AU/gaze features to both pathways
+                total_vis_features = len(self.au_indices) + len(self.gaze_indices)
+                pose_input_size = total_vis_features // 3  # 1/3 for pose pathway
+                cnn_input_size = total_vis_features - pose_input_size  # Rest for CNN
+            
+            # Sizes for each encoder pathway (roughly proportional to their importance)
+            pose_hidden_size = hidden_size // 3
+            au_hidden_size = hidden_size // 3 + hidden_size // 6  # Slightly larger
+            audio_hidden_size = hidden_size // 3
+            
+            # Create pose xLSTM encoder
             self.pose_encoder = xLSTMEncoder(
-                input_size=len(self.pose_indices),
-                hidden_size=hidden_size // 2,  # Smaller dimension for pose features
+                input_size=pose_input_size,
+                hidden_size=pose_hidden_size,
                 seq_length=seq_length,
                 dropout=dropout,
                 num_blocks=num_layers
             )
             
-            # Use CNN for AU/gaze features (better at local patterns)
+            # Create CNN encoder for facial expressions
             self.au_encoder = CNNEncoder(
-                input_size=len(self.au_indices) + len(self.gaze_indices),
-                hidden_size=hidden_size // 2 + hidden_size // 4,  # Larger dimension for AU features
+                input_size=cnn_input_size,
+                hidden_size=au_hidden_size,
                 seq_length=seq_length,
                 dropout=dropout,
                 num_conv_layers=num_layers
             )
             
-            # Merger for feature group encodings
-            merged_size = hidden_size + hidden_size // 4
+            # Create audio encoder (if audio features are included)
+            if include_audio and self.audio_input_size > 0:
+                self.audio_encoder = AudioEncoder(
+                    input_size=self.audio_input_size,
+                    hidden_size=audio_hidden_size,
+                    seq_length=seq_length,
+                    dropout=dropout,
+                    num_blocks=num_layers
+                )
+            
+            # Merger for all feature group encodings
+            merged_size = pose_hidden_size + au_hidden_size
+            if include_audio and self.audio_input_size > 0:
+                merged_size += audio_hidden_size
+            
             self.feature_merger = nn.Linear(merged_size, hidden_size)
             self.merger_dropout = nn.Dropout(dropout)
             
             # BALANCED FUSION: Create separate projections for each pathway
-            pose_projection_size = hidden_size // 2
-            au_projection_size = hidden_size // 2 + hidden_size // 4
+            # Project all pathways to a common dimension for fair comparison
+            self.pose_projection = nn.Linear(pose_hidden_size, hidden_size // 4)
+            self.au_projection = nn.Linear(au_hidden_size, hidden_size // 4)
             
-            # Project both pathways to a common dimension for fair comparison
-            self.pose_projection = nn.Linear(pose_projection_size, hidden_size // 3)
-            self.au_projection = nn.Linear(au_projection_size, hidden_size // 3)
-            
-            # Balanced fusion attention mechanism that uses both pathways
-            self.feature_attention = nn.Sequential(
-                nn.Linear(hidden_size // 3 * 2, hidden_size // 3),  # Combined dimension from both pathways
-                nn.Tanh(),
-                nn.Linear(hidden_size // 3, 2)  # 2 outputs for the two pathways
-            )
+            if include_audio and self.audio_input_size > 0:
+                self.audio_projection = nn.Linear(audio_hidden_size, hidden_size // 4)
+                # Balanced fusion attention mechanism that uses all three pathways
+                self.feature_attention = nn.Sequential(
+                    nn.Linear(hidden_size // 4 * 3, hidden_size // 4),  # Combined dimension from three pathways
+                    nn.Tanh(),
+                    nn.Linear(hidden_size // 4, 3)  # 3 outputs for the three pathways
+                )
+            else:
+                # Two-way attention if audio is not included
+                self.feature_attention = nn.Sequential(
+                    nn.Linear(hidden_size // 4 * 2, hidden_size // 4),  # Combined dimension from two pathways
+                    nn.Tanh(),
+                    nn.Linear(hidden_size // 4, 2)  # 2 outputs for the two pathways
+                )
         else:
-            # If no pose features, use CNN for AU/gaze features only
+            # If not using hybrid pathways, fall back to single encoder for all features
+            combined_input_size = 0
+            if include_pose:
+                combined_input_size += len(self.pose_indices)
+            combined_input_size += len(self.au_indices) + len(self.gaze_indices)
+            
             self.au_gaze_encoder = CNNEncoder(
-                input_size=len(self.au_indices) + len(self.gaze_indices),
+                input_size=combined_input_size,
                 hidden_size=hidden_size,
                 seq_length=seq_length,
                 dropout=dropout,
                 num_conv_layers=num_layers
             )
+            
+            # Separate audio encoder even in non-hybrid mode if audio is included
+            if include_audio and self.audio_input_size > 0:
+                self.audio_encoder = AudioEncoder(
+                    input_size=self.audio_input_size,
+                    hidden_size=hidden_size // 3,
+                    seq_length=seq_length,
+                    dropout=dropout,
+                    num_blocks=num_layers
+                )
+                
+                # Two-way merger for non-hybrid visual + audio
+                self.feature_merger = nn.Linear(hidden_size + (hidden_size // 3), hidden_size)
+                self.merger_dropout = nn.Dropout(dropout)
+                
+                # Two-way attention for visual + audio in non-hybrid mode
+                self.visual_projection = nn.Linear(hidden_size, hidden_size // 4)
+                self.audio_projection = nn.Linear(hidden_size // 3, hidden_size // 4)
+                self.feature_attention = nn.Sequential(
+                    nn.Linear(hidden_size // 4 * 2, hidden_size // 4),
+                    nn.Tanh(),
+                    nn.Linear(hidden_size // 4, 2)  # 2 outputs (visual + audio)
+                )
         
         # Final processing layers
         self.feature_pooling = nn.Sequential(
@@ -288,6 +440,7 @@ class HybridDepBinaryClassifier(nn.Module):
         # For storing feature importance information
         self.feature_importances = {}
         self.last_attention_weights = None
+        self.last_modality_weights = None
     
     def _create_feature_group_indices(self):
         """Create indices for each feature group based on feature names"""
@@ -305,44 +458,81 @@ class HybridDepBinaryClassifier(nn.Module):
         
         return pose_indices, gaze_indices, au_indices
     
-    def _split_features(self, x):
-        """Split input features into feature groups"""
+    def _split_features(self, x, audio_features=None):
+        """
+        Split input features into feature groups for different pathways
+        
+        Args:
+            x (torch.Tensor): Visual features [batch, seq_length, visual_features]
+            audio_features (torch.Tensor): Audio features [batch, seq_length, audio_features]
+            
+        Returns:
+            tuple: Feature tensors for each pathway
+        """
         # Create empty tensors for each group
         batch_size, seq_len, _ = x.shape
         
-        if self.include_pose and len(self.pose_indices) > 0:
-            pose_features = torch.zeros(batch_size, seq_len, len(self.pose_indices), device=x.device)
-            au_gaze_features = torch.zeros(batch_size, seq_len, len(self.au_indices) + len(self.gaze_indices), device=x.device)
+        if self.use_hybrid_pathways:
+            # When using hybrid pathways...
+            if self.include_pose and len(self.pose_indices) > 0:
+                # With pose: pose goes to xLSTM, AU/gaze to CNN
+                pose_features = torch.zeros(batch_size, seq_len, len(self.pose_indices), device=x.device)
+                au_gaze_features = torch.zeros(batch_size, seq_len, len(self.au_indices) + len(self.gaze_indices), device=x.device)
+                
+                # Fill with appropriate features
+                for i, idx in enumerate(self.pose_indices):
+                    pose_features[:, :, i] = x[:, :, idx]
+                
+                au_gaze_idx = 0
+                for idx in self.gaze_indices + self.au_indices:
+                    au_gaze_features[:, :, au_gaze_idx] = x[:, :, idx]
+                    au_gaze_idx += 1
+            else:
+                # Without pose: split AU/gaze features between pathways
+                all_features = self.gaze_indices + self.au_indices
+                split_point = len(all_features) // 3  # Give 1/3 to xLSTM pathway
+                
+                # First third goes to xLSTM pathway (if it needs temporal dynamics)
+                xlstm_indices = all_features[:split_point]
+                # Remaining goes to CNN pathway
+                cnn_indices = all_features[split_point:]
+                
+                pose_features = torch.zeros(batch_size, seq_len, len(xlstm_indices), device=x.device)
+                au_gaze_features = torch.zeros(batch_size, seq_len, len(cnn_indices), device=x.device)
+                
+                # Fill features for xLSTM pathway
+                for i, idx in enumerate(xlstm_indices):
+                    pose_features[:, :, i] = x[:, :, idx]
+                
+                # Fill features for CNN pathway
+                for i, idx in enumerate(cnn_indices):
+                    au_gaze_features[:, :, i] = x[:, :, idx]
             
-            # Fill with appropriate features
-            for i, idx in enumerate(self.pose_indices):
-                pose_features[:, :, i] = x[:, :, idx]
-            
-            au_gaze_idx = 0
-            for idx in self.gaze_indices + self.au_indices:
-                au_gaze_features[:, :, au_gaze_idx] = x[:, :, idx]
-                au_gaze_idx += 1
-            
-            return pose_features, au_gaze_features
+            return pose_features, au_gaze_features, audio_features
         else:
-            # If no pose features, just return AU and gaze features
-            au_gaze_features = torch.zeros(batch_size, seq_len, len(self.au_indices) + len(self.gaze_indices), device=x.device)
+            # When not using hybrid pathways, collect all available features
+            all_indices = []
+            if self.include_pose:
+                all_indices.extend(self.pose_indices)
+            all_indices.extend(self.gaze_indices + self.au_indices)
             
-            au_gaze_idx = 0
-            for idx in self.gaze_indices + self.au_indices:
-                au_gaze_features[:, :, au_gaze_idx] = x[:, :, idx]
-                au_gaze_idx += 1
+            au_gaze_features = torch.zeros(batch_size, seq_len, len(all_indices), device=x.device)
             
-            return None, au_gaze_features
+            for i, idx in enumerate(all_indices):
+                au_gaze_features[:, :, i] = x[:, :, idx]
+            
+            return None, au_gaze_features, audio_features
     
-    def forward(self, x, return_intermediates=False):
+    def forward(self, x, audio_features=None, return_intermediates=False):
         """
         Forward pass with separate pathways:
-        - xLSTM for pose features
+        - xLSTM for pose features 
         - CNN for AU/gaze features
+        - Audio xLSTM for audio features
         
         Args:
-            x (torch.Tensor): Input features [batch, seq_length, input_size]
+            x (torch.Tensor): Visual input features [batch, seq_length, input_size]
+            audio_features (torch.Tensor, optional): Audio features if provided separately
             return_intermediates (bool): Whether to return intermediate activations
             
         Returns:
@@ -351,53 +541,81 @@ class HybridDepBinaryClassifier(nn.Module):
         # x shape: [batch, seq_length, input_size]
         batch_size, seq_len, _ = x.shape
         
+        # Get audio features if passed as separate input
+        if audio_features is None and self.include_audio and hasattr(x, 'audio_features'):
+            # This handles the case where audio features are in the input dictionary
+            audio_features = x.audio_features
+        
         # Split features into groups
-        pose_features, au_gaze_features = self._split_features(x)
+        pose_features, au_gaze_features, audio_features = self._split_features(x, audio_features)
         
-        intermediates = {'input': x, 'au_gaze_features': au_gaze_features}
+        intermediates = {
+            'input': x, 
+            'au_gaze_features': au_gaze_features,
+            'audio_features': audio_features
+        }
         
-        if self.include_pose and pose_features is not None:
-            # Apply targeted higher dropout to pose features during training
-            # This forces the model to rely less on pose features
-            if self.training and self.pose_dropout > 0:
+        if self.use_hybrid_pathways:
+            # Use multiple pathways
+            
+            # Apply targeted dropout during training
+            if self.include_pose and self.training and self.pose_dropout > 0:
                 pose_features = self.pose_feature_dropout(pose_features, self.training)
                 intermediates['pose_features_after_dropout'] = pose_features
-            
-            # Process pose features with xLSTM (good for temporal dynamics)
+                
+            # Process features with respective encoders
             pose_encoded = self.pose_encoder(pose_features)
-            
-            # Process AU/gaze features with CNN (good for local patterns)
             au_gaze_encoded = self.au_encoder(au_gaze_features)
+            
+            # Process audio if included
+            audio_encoded = None
+            if self.include_audio and audio_features is not None and hasattr(self, 'audio_encoder'):
+                if self.training and self.audio_dropout > 0:
+                    audio_features = self.audio_feature_dropout(audio_features, self.training)
+                audio_encoded = self.audio_encoder(audio_features)
+                intermediates['audio_encoded'] = audio_encoded
             
             intermediates['pose_features'] = pose_features
             intermediates['pose_encoded'] = pose_encoded
             intermediates['au_gaze_encoded'] = au_gaze_encoded
             
-            # BALANCED FUSION: Get representations from both pathways
+            # BALANCED FUSION: Get representations from all pathways
             
-            # Apply attention to AU/gaze features using CNN's attention mechanism
+            # Apply attention to AU/gaze features
             au_gaze_attended = self.au_encoder.apply_attention(au_gaze_encoded)
             
             # Use last timestep of pose encoding
             pose_attended = pose_encoded[:, -1, :]
             
-            # Project both attended representations to a common dimension
+            # Project representations to a common dimension
             pose_proj = self.pose_projection(pose_attended)
             au_gaze_proj = self.au_projection(au_gaze_attended)
             
-            # Combine projections for balanced attention computation
-            combined_proj = torch.cat([pose_proj, au_gaze_proj], dim=1)
+            if self.include_audio and audio_encoded is not None and hasattr(self, 'audio_projection'):
+                # Apply attention to audio features
+                audio_attended = self.audio_encoder.apply_attention(audio_encoded)
+                audio_proj = self.audio_projection(audio_attended)
+                
+                # Three-way fusion
+                combined_proj = torch.cat([pose_proj, au_gaze_proj, audio_proj], dim=1)
+                attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
+                self.last_modality_weights = attention_weights.detach()
+                
+                # Merge all three encodings
+                merged = torch.cat([pose_encoded, au_gaze_encoded, audio_encoded], dim=2)
+            else:
+                # Two-way fusion
+                combined_proj = torch.cat([pose_proj, au_gaze_proj], dim=1)
+                attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
+                self.last_modality_weights = attention_weights.detach()
+                
+                # Merge the two encodings
+                merged = torch.cat([pose_encoded, au_gaze_encoded], dim=2)
             
-            # Compute balanced attention weights using information from both pathways
-            attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
-            self.last_group_attention = attention_weights.detach()
+            intermediates['modality_attention'] = attention_weights
             
-            intermediates['group_attention'] = attention_weights
-            
-            # Merge feature group encodings
-            merged = torch.cat([pose_encoded, au_gaze_encoded], dim=2)
+            # Apply merger
             merged = self.merger_dropout(self.feature_merger(merged))
-            
             intermediates['merged'] = merged
             
             # Apply global attention pooling
@@ -409,19 +627,55 @@ class HybridDepBinaryClassifier(nn.Module):
             pooled = torch.sum(merged * attn_weights, dim=1)
             
         else:
-            # If no pose features, process through the AU/gaze encoder only using CNN
+            # If not using hybrid pathways, process visual features through a single encoder
             cnn_output = self.au_gaze_encoder(au_gaze_features)
             
-            # Apply global attention pooling
-            attn_scores = self.global_attention(cnn_output).squeeze(-1)
-            attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)
-            self.last_attention_weights = attn_weights.detach()
+            if self.include_audio and audio_features is not None and hasattr(self, 'audio_encoder'):
+                # Process audio separately
+                audio_output = self.audio_encoder(audio_features)
+                
+                # Apply global attention to each pathway
+                visual_attended = torch.sum(cnn_output * F.softmax(
+                    self.global_attention(cnn_output).squeeze(-1), dim=1).unsqueeze(2), dim=1)
+                
+                audio_attended = self.audio_encoder.apply_attention(audio_output)
+                
+                # Project to common dimension
+                visual_proj = self.visual_projection(visual_attended)
+                audio_proj = self.audio_projection(audio_attended)
+                
+                # Two-way fusion for visual and audio
+                combined_proj = torch.cat([visual_proj, audio_proj], dim=1)
+                attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
+                self.last_modality_weights = attention_weights.detach()
+                
+                # Combine visual and audio pathways
+                merged = torch.cat([cnn_output, audio_output], dim=2)
+                merged = self.merger_dropout(self.feature_merger(merged))
+                
+                # Apply global attention pooling
+                attn_scores = self.global_attention(merged).squeeze(-1)
+                attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)
+                self.last_attention_weights = attn_weights.detach()
+                
+                # Weighted sum based on attention
+                pooled = torch.sum(merged * attn_weights, dim=1)
+                
+                intermediates['cnn_output'] = cnn_output
+                intermediates['audio_output'] = audio_output
+                intermediates['modality_attention'] = attention_weights
+            else:
+                # Visual-only pathway
+                # Apply global attention pooling
+                attn_scores = self.global_attention(cnn_output).squeeze(-1)
+                attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(2)
+                self.last_attention_weights = attn_weights.detach()
+                
+                # Weighted sum based on attention
+                pooled = torch.sum(cnn_output * attn_weights, dim=1)
+                
+                intermediates['cnn_output'] = cnn_output
             
-            # Weighted sum based on attention
-            pooled = torch.sum(cnn_output * attn_weights, dim=1)
-            
-            intermediates['cnn_output'] = cnn_output
-        
         intermediates['attention_weights'] = attn_weights
         
         # Apply feature pooling and final classification
@@ -576,7 +830,7 @@ class HybridDepBinaryClassifier(nn.Module):
         
         return importance_dict
     
-    def integrated_gradients(self, x, baseline=None, steps=50, target_class=1):
+    def integrated_gradients(self, x, audio_features=None, baseline=None, steps=50, target_class=1):
         """Calculate feature importance using integrated gradients"""
         # Set model to eval mode and ensure we're working with PyTorch tensors
         self.eval()
@@ -585,18 +839,32 @@ class HybridDepBinaryClassifier(nn.Module):
         # Create baseline if not provided (zeros)
         if baseline is None:
             baseline = torch.zeros_like(x)
+            if audio_features is not None:
+                audio_baseline = torch.zeros_like(audio_features)
+            else:
+                audio_baseline = None
+        else:
+            audio_baseline = torch.zeros_like(audio_features) if audio_features is not None else None
         
         # Scale inputs along path from baseline to input
         scaled_inputs = [baseline + (float(i) / steps) * (x - baseline) for i in range(steps + 1)]
+        if audio_features is not None:
+            scaled_audio = [audio_baseline + (float(i) / steps) * (audio_features - audio_baseline) 
+                           for i in range(steps + 1)]
+        else:
+            scaled_audio = [None] * (steps + 1)
         
         # Calculate gradients at each step
         total_gradients = torch.zeros_like(x)
+        if audio_features is not None:
+            total_audio_gradients = torch.zeros_like(audio_features)
         
-        for i, scaled_input in enumerate(scaled_inputs):
-            scaled_input = scaled_input.clone().detach().requires_grad_(True)
+        for i in range(steps + 1):
+            scaled_input = scaled_inputs[i].clone().detach().requires_grad_(True)
+            scaled_audio_input = scaled_audio[i].clone().detach().requires_grad_(True) if scaled_audio[i] is not None else None
             
             # Forward pass
-            logits = self(scaled_input)
+            logits = self(scaled_input, scaled_audio_input)
             
             # Determine target based on class
             if target_class == 1:
@@ -605,12 +873,21 @@ class HybridDepBinaryClassifier(nn.Module):
                 target = -logits  # We want negative logits for "not depressed" class
             
             # Compute gradients for this step
-            grad = torch.autograd.grad(
-                outputs=target.sum(),
-                inputs=scaled_input,
-                create_graph=False,
-                retain_graph=False
-            )[0]
+            if scaled_audio_input is not None:
+                grad, audio_grad = torch.autograd.grad(
+                    outputs=target.sum(),
+                    inputs=[scaled_input, scaled_audio_input],
+                    create_graph=False,
+                    retain_graph=False
+                )
+                total_audio_gradients += audio_grad.detach()
+            else:
+                grad = torch.autograd.grad(
+                    outputs=target.sum(),
+                    inputs=scaled_input,
+                    create_graph=False,
+                    retain_graph=False
+                )[0]
             
             # Accumulate gradients
             total_gradients += grad.detach()
@@ -621,24 +898,48 @@ class HybridDepBinaryClassifier(nn.Module):
         # Element-wise multiply average gradients with the input-baseline difference
         attributions = (x - baseline) * avg_gradients
         
+        # Do the same for audio if present
+        if audio_features is not None:
+            avg_audio_gradients = total_audio_gradients / (steps + 1)
+            audio_attributions = (audio_features - audio_baseline) * avg_audio_gradients
+        
         # Sum over batch and sequence dimensions
-        feature_importance = torch.mean(torch.abs(attributions), dim=(0, 1)).cpu().numpy()
+        visual_importance = torch.mean(torch.abs(attributions), dim=(0, 1)).cpu().numpy()
         
         # Normalize if possible
-        if np.sum(feature_importance) > 0:
-            feature_importance = feature_importance / np.sum(feature_importance)
+        if np.sum(visual_importance) > 0:
+            visual_importance = visual_importance / np.sum(visual_importance)
+        
+        # Process audio importance if available
+        if audio_features is not None:
+            audio_importance = torch.mean(torch.abs(audio_attributions), dim=(0, 1)).cpu().numpy()
+            if np.sum(audio_importance) > 0:
+                audio_importance = audio_importance / np.sum(audio_importance)
+        else:
+            audio_importance = None
         
         # Store in feature importances
         if 'global' not in self.feature_importances:
             self.feature_importances['global'] = {}
         
-        self.feature_importances['global']['integrated_gradients'] = feature_importance
+        self.feature_importances['global']['integrated_gradients_visual'] = visual_importance
+        if audio_importance is not None:
+            self.feature_importances['global']['integrated_gradients_audio'] = audio_importance
         
         # Map to feature names
         importance_dict = {
-            self.feature_names[i]: feature_importance[i] 
-            for i in range(min(len(self.feature_names), len(feature_importance)))
+            self.feature_names[i]: visual_importance[i] 
+            for i in range(min(len(self.feature_names), len(visual_importance)))
         }
+        
+        # Add audio feature importance if available
+        if audio_importance is not None and self.audio_feature_names:
+            audio_importance_dict = {
+                self.audio_feature_names[i]: audio_importance[i]
+                for i in range(min(len(self.audio_feature_names), len(audio_importance)))
+            }
+            # Combine visual and audio importance
+            importance_dict.update(audio_importance_dict)
         
         return importance_dict
     
@@ -671,8 +972,18 @@ class HybridDepBinaryClassifier(nn.Module):
         }
     
     def visualize_feature_importance(self, importance_dict=None, top_k=20, save_path=None, 
-                                   title="Top Feature Importance for Depression Detection"):
-        """Visualize feature importance"""
+                                   title="Top Feature Importance for Depression Detection",
+                                   highlight_audio=True):
+        """
+        Visualize feature importance including audio features if available
+        
+        Args:
+            importance_dict: Dictionary of feature importances
+            top_k: Number of top features to show
+            save_path: Path to save visualization
+            title: Plot title
+            highlight_audio: Whether to highlight audio features
+        """
         if importance_dict is None:
             if self.feature_importances is None or 'global' not in self.feature_importances:
                 raise ValueError("No feature importance data available")
@@ -689,6 +1000,14 @@ class HybridDepBinaryClassifier(nn.Module):
                 self.feature_names[i]: importance_array[i]
                 for i in range(min(len(self.feature_names), len(importance_array)))
             }
+            
+            # Add audio feature importance if available
+            if hasattr(self, 'audio_feature_names') and len(self.audio_feature_names) > 0:
+                if 'integrated_gradients_audio' in self.feature_importances['global']:
+                    audio_importance = self.feature_importances['global']['integrated_gradients_audio']
+                    for i, name in enumerate(self.audio_feature_names):
+                        if i < len(audio_importance):
+                            importance_dict[name] = audio_importance[i]
         
         # Sort features by importance
         sorted_features = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
@@ -699,38 +1018,57 @@ class HybridDepBinaryClassifier(nn.Module):
         importance_values = [f[1] for f in top_features]
         
         # Create visualization
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(14, 10))
         bars = plt.barh(range(len(feature_names)), importance_values, align='center')
         plt.yticks(range(len(feature_names)), feature_names)
         plt.xlabel('Importance')
         plt.title(title)
         
-        # Highlight AUs of interest
+        # Highlight features by type
+        au_color = 'red'
+        pose_color = 'green'
+        audio_color = 'purple'
+        default_color = 'cornflowerblue'
+        
+        has_audio = False
+        has_aus = False
+        has_pose = False
+        
+        # Clinically significant AUs
         highlighted_aus = ['AU01', 'AU04', 'AU05', 'AU06', 'AU07', 'AU12', 'AU15']
-        has_highlighted = False
         
         for i, feature in enumerate(feature_names):
-            for au in highlighted_aus:
-                if au in feature:
-                    bars[i].set_color('red')
-                    has_highlighted = True
-                    break
-            
-            # Highlight pose features with different color
-            if 'pose_' in feature:
-                bars[i].set_color('green')
-                has_highlighted = True
+            # Check if it's an audio feature
+            if highlight_audio and feature in self.audio_feature_names:
+                bars[i].set_color(audio_color)
+                has_audio = True
+            # Check if it's a clinically significant AU
+            elif any(au in feature for au in highlighted_aus):
+                bars[i].set_color(au_color)
+                has_aus = True
+            # Check if it's a pose feature
+            elif 'pose_' in feature:
+                bars[i].set_color(pose_color)
+                has_pose = True
+            # Default color for other features
+            else:
+                bars[i].set_color(default_color)
         
         # Add legend to explain colors
         from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='red', label='Clinically Significant AUs'),
-            Patch(facecolor='green', label='Pose Features'),
-            Patch(facecolor='cornflowerblue', label='Other Features')
-        ]
+        legend_elements = []
+        
+        if has_aus:
+            legend_elements.append(Patch(facecolor=au_color, label='Clinically Significant AUs'))
+        if has_pose:
+            legend_elements.append(Patch(facecolor=pose_color, label='Pose Features'))
+        if has_audio:
+            legend_elements.append(Patch(facecolor=audio_color, label='Audio Features'))
+        
+        legend_elements.append(Patch(facecolor=default_color, label='Other Features'))
         
         # Only show legend if we have at least one highlighted feature
-        if has_highlighted:
+        if legend_elements:
             plt.legend(handles=legend_elements, loc='upper right')
         
         plt.tight_layout()
@@ -739,6 +1077,25 @@ class HybridDepBinaryClassifier(nn.Module):
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
         
         return plt.gcf()
+    
+    def get_modality_importance(self):
+        """Get relative importance of each modality (CNN, xLSTM, Audio)"""
+        if not hasattr(self, 'last_modality_weights'):
+            return None
+        
+        weights = self.last_modality_weights.cpu().numpy().mean(axis=0)
+        
+        if self.include_audio and hasattr(self, 'audio_encoder') and len(weights) == 3:
+            return {
+                'pose': weights[0],
+                'facial_expressions': weights[1],
+                'audio': weights[2]
+            }
+        else:
+            return {
+                'pose': weights[0],
+                'facial_expressions': weights[1]
+            }
     
     def get_clinical_au_importance(self):
         """Extract importance of clinically significant Action Units"""
@@ -777,3 +1134,34 @@ class HybridDepBinaryClassifier(nn.Module):
                                    reverse=True)}
         
         return clinical_importance
+    
+    def get_audio_feature_importance(self):
+        """Extract importance of audio features"""
+        if not hasattr(self, 'audio_feature_names') or not self.audio_feature_names:
+            return {}
+            
+        if self.feature_importances is None or 'global' not in self.feature_importances:
+            raise ValueError("No feature importance data available")
+            
+        # Get audio-specific importance if available
+        if 'integrated_gradients_audio' in self.feature_importances['global']:
+            audio_importance = self.feature_importances['global']['integrated_gradients_audio']
+            return {
+                self.audio_feature_names[i]: audio_importance[i]
+                for i in range(min(len(self.audio_feature_names), len(audio_importance)))
+            }
+        else:
+            # Try to extract from global importance
+            global_importance = self.feature_importances['global'].get('integrated_gradients', 
+                                   next(iter(self.feature_importances['global'].values())))
+            
+            # Return empty dict if dimensions don't match
+            if len(global_importance) < len(self.feature_names) + len(self.audio_feature_names):
+                return {}
+                
+            # Extract audio feature importance from the end of the array
+            audio_importance = global_importance[len(self.feature_names):]
+            return {
+                self.audio_feature_names[i]: audio_importance[i]
+                for i in range(min(len(self.audio_feature_names), len(audio_importance)))
+            }
