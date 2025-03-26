@@ -264,10 +264,72 @@ class AudioEncoder(nn.Module):
         
         return attended
 
+class CrossModalTransformer(nn.Module):
+    """
+    Cross-Modal Transformer for effective information exchange between modalities.
+    Enables each modality to attend to others, creating richer representations.
+    """
+    def __init__(self, hidden_size, num_heads=4, dropout=0.1):
+        super(CrossModalTransformer, self).__init__()
+        self.hidden_size = hidden_size
+        
+        # Multi-head attention mechanisms
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Feed-forward network after attention
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 2, hidden_size)
+        )
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, query, key_value):
+        """
+        Args:
+            query: Features from one modality [batch, seq_len, hidden_size]
+            key_value: Features from another modality [batch, seq_len, hidden_size]
+            
+        Returns:
+            Enhanced query features with cross-modal context
+        """
+        # Cross-attention: query attends to key_value
+        attn_output, attn_weights = self.cross_attention(
+            query=self.norm1(query),
+            key=self.norm1(key_value),
+            value=self.norm1(key_value)
+        )
+        
+        # Store attention weights for visualization
+        self.last_attn_weights = attn_weights.detach()
+        
+        # Residual connection
+        query = query + self.dropout(attn_output)
+        
+        # Feed-forward network
+        ffn_output = self.ffn(self.norm2(query))
+        
+        # Final residual connection
+        output = query + self.dropout(ffn_output)
+        
+        return output
+
 class HybridDepBinaryClassifier(nn.Module):
     def __init__(self, input_size=75, hidden_size=128, num_layers=2, dropout=0.5, pose_dropout=0.4, 
                  audio_dropout=0.3, seq_length=150, feature_names=None, audio_feature_names=None,
-                 include_pose=True, include_audio=True, use_hybrid_pathways=True):
+                 include_pose=True, include_audio=True, use_hybrid_pathways=True, 
+                 fusion_type="attention"):
         """
         Hybrid CNN-xLSTM-Audio model for depression detection
         
@@ -284,10 +346,11 @@ class HybridDepBinaryClassifier(nn.Module):
             include_pose (bool): Whether pose features are included
             include_audio (bool): Whether audio features are included
             use_hybrid_pathways (bool): Whether to use multiple pathways regardless of feature types
+            fusion_type (str): Type of fusion to use: "attention", "cross_modal"
         """
         super(HybridDepBinaryClassifier, self).__init__()
-
-        # Store feature names for interpretability
+        
+        # Store feature names and configuration
         self.feature_names = feature_names if feature_names else [f"feature_{i}" for i in range(input_size)]
         self.audio_feature_names = audio_feature_names if audio_feature_names else []
         self.input_size = input_size
@@ -297,6 +360,7 @@ class HybridDepBinaryClassifier(nn.Module):
         self.pose_dropout = pose_dropout
         self.audio_dropout = audio_dropout
         self.use_hybrid_pathways = use_hybrid_pathways
+        self.fusion_type = fusion_type
         
         # Create feature group indices
         self.pose_indices, self.gaze_indices, self.au_indices = self._create_feature_group_indices()
@@ -320,9 +384,25 @@ class HybridDepBinaryClassifier(nn.Module):
                 cnn_input_size = total_vis_features - pose_input_size  # Rest for CNN
             
             # Sizes for each encoder pathway (roughly proportional to their importance)
-            pose_hidden_size = hidden_size // 3
-            au_hidden_size = hidden_size // 3 + hidden_size // 6  # Slightly larger
-            audio_hidden_size = hidden_size // 3
+            # Modified: Calculate hidden sizes that are divisible by 4 (number of attention heads)
+            # We'll use approximately 1/3 of total hidden size for each modality, 
+            # but ensure divisibility by 4
+            
+            # Base hidden size divisible by 12 (so each 1/3 is divisible by 4)
+            adjusted_hidden_size = hidden_size - (hidden_size % 12)
+            
+            # Allocate hidden sizes to be approximately 1/3 each but ensure divisibility by 4
+            pose_hidden_size = adjusted_hidden_size // 3
+            pose_hidden_size = pose_hidden_size - (pose_hidden_size % 4)  # Ensure divisible by 4
+            
+            au_hidden_size = adjusted_hidden_size // 3
+            au_hidden_size = au_hidden_size - (au_hidden_size % 4)  # Ensure divisible by 4
+            
+            audio_hidden_size = adjusted_hidden_size // 3
+            audio_hidden_size = audio_hidden_size - (audio_hidden_size % 4)  # Ensure divisible by 4
+            
+            # Print hidden sizes for debugging
+            print(f"Adjusted pathway hidden sizes: Pose={pose_hidden_size}, AU/Gaze={au_hidden_size}, Audio={audio_hidden_size}")
             
             # Create pose xLSTM encoder
             self.pose_encoder = xLSTMEncoder(
@@ -352,34 +432,59 @@ class HybridDepBinaryClassifier(nn.Module):
                     num_blocks=num_layers
                 )
             
-            # Merger for all feature group encodings
-            merged_size = pose_hidden_size + au_hidden_size
-            if include_audio and self.audio_input_size > 0:
-                merged_size += audio_hidden_size
-            
-            self.feature_merger = nn.Linear(merged_size, hidden_size)
-            self.merger_dropout = nn.Dropout(dropout)
-            
-            # BALANCED FUSION: Create separate projections for each pathway
-            # Project all pathways to a common dimension for fair comparison
-            self.pose_projection = nn.Linear(pose_hidden_size, hidden_size // 4)
-            self.au_projection = nn.Linear(au_hidden_size, hidden_size // 4)
-            
-            if include_audio and self.audio_input_size > 0:
-                self.audio_projection = nn.Linear(audio_hidden_size, hidden_size // 4)
-                # Balanced fusion attention mechanism that uses all three pathways
-                self.feature_attention = nn.Sequential(
-                    nn.Linear(hidden_size // 4 * 3, hidden_size // 4),  # Combined dimension from three pathways
-                    nn.Tanh(),
-                    nn.Linear(hidden_size // 4, 3)  # 3 outputs for the three pathways
-                )
+            # FUSION MECHANISMS
+            if self.fusion_type == "cross_modal":
+                # Cross-modal transformer fusion
+                if include_audio and self.audio_input_size > 0:
+                    # Three-way cross-modal attention
+                    self.cm_pose_au = CrossModalTransformer(hidden_size=pose_hidden_size, dropout=dropout)
+                    self.cm_pose_audio = CrossModalTransformer(hidden_size=pose_hidden_size, dropout=dropout)
+                    self.cm_au_pose = CrossModalTransformer(hidden_size=au_hidden_size, dropout=dropout)
+                    self.cm_au_audio = CrossModalTransformer(hidden_size=au_hidden_size, dropout=dropout)
+                    self.cm_audio_pose = CrossModalTransformer(hidden_size=audio_hidden_size, dropout=dropout)
+                    self.cm_audio_au = CrossModalTransformer(hidden_size=audio_hidden_size, dropout=dropout)
+                else:
+                    # Two-way cross-modal attention
+                    self.cm_pose_au = CrossModalTransformer(hidden_size=pose_hidden_size, dropout=dropout)
+                    self.cm_au_pose = CrossModalTransformer(hidden_size=au_hidden_size, dropout=dropout)
+                
+                # Merger for final representation
+                merged_size = pose_hidden_size + au_hidden_size
+                if include_audio and self.audio_input_size > 0:
+                    merged_size += audio_hidden_size
+                
+                self.feature_merger = nn.Linear(merged_size, hidden_size)
+                self.merger_dropout = nn.Dropout(dropout)
             else:
-                # Two-way attention if audio is not included
-                self.feature_attention = nn.Sequential(
-                    nn.Linear(hidden_size // 4 * 2, hidden_size // 4),  # Combined dimension from two pathways
-                    nn.Tanh(),
-                    nn.Linear(hidden_size // 4, 2)  # 2 outputs for the two pathways
-                )
+                # Default to original attention-based fusion
+                # Merger for all feature group encodings
+                merged_size = pose_hidden_size + au_hidden_size
+                if include_audio and self.audio_input_size > 0:
+                    merged_size += audio_hidden_size
+                
+                self.feature_merger = nn.Linear(merged_size, hidden_size)
+                self.merger_dropout = nn.Dropout(dropout)
+                
+                # BALANCED FUSION: Create separate projections for each pathway
+                # Project all pathways to a common dimension for fair comparison
+                self.pose_projection = nn.Linear(pose_hidden_size, hidden_size // 4)
+                self.au_projection = nn.Linear(au_hidden_size, hidden_size // 4)
+                
+                if include_audio and self.audio_input_size > 0:
+                    self.audio_projection = nn.Linear(audio_hidden_size, hidden_size // 4)
+                    # Balanced fusion attention mechanism that uses all three pathways
+                    self.feature_attention = nn.Sequential(
+                        nn.Linear(hidden_size // 4 * 3, hidden_size // 4),  # Combined dimension from three pathways
+                        nn.Tanh(),
+                        nn.Linear(hidden_size // 4, 3)  # 3 outputs for the three pathways
+                    )
+                else:
+                    # Two-way attention if audio is not included
+                    self.feature_attention = nn.Sequential(
+                        nn.Linear(hidden_size // 4 * 2, hidden_size // 4),  # Combined dimension from two pathways
+                        nn.Tanh(),
+                        nn.Linear(hidden_size // 4, 2)  # 2 outputs for the two pathways
+                    )
         else:
             # If not using hybrid pathways, fall back to single encoder for all features
             combined_input_size = 0
@@ -575,48 +680,80 @@ class HybridDepBinaryClassifier(nn.Module):
                 audio_encoded = self.audio_encoder(audio_features)
                 intermediates['audio_encoded'] = audio_encoded
             
-            intermediates['pose_features'] = pose_features
-            intermediates['pose_encoded'] = pose_encoded
-            intermediates['au_gaze_encoded'] = au_gaze_encoded
-            
-            # BALANCED FUSION: Get representations from all pathways
-            
-            # Apply attention to AU/gaze features
-            au_gaze_attended = self.au_encoder.apply_attention(au_gaze_encoded)
-            
-            # Use last timestep of pose encoding
-            pose_attended = pose_encoded[:, -1, :]
-            
-            # Project representations to a common dimension
-            pose_proj = self.pose_projection(pose_attended)
-            au_gaze_proj = self.au_projection(au_gaze_attended)
-            
-            if self.include_audio and audio_encoded is not None and hasattr(self, 'audio_projection'):
-                # Apply attention to audio features
-                audio_attended = self.audio_encoder.apply_attention(audio_encoded)
-                audio_proj = self.audio_projection(audio_attended)
+            # FUSION MECHANISM BASED ON TYPE
+            if self.fusion_type == "cross_modal":
+                # Cross-modal transformer fusion
+                # Each modality attends to all other modalities
+                pose_enhanced = pose_encoded
+                au_gaze_enhanced = au_gaze_encoded
                 
-                # Three-way fusion
-                combined_proj = torch.cat([pose_proj, au_gaze_proj, audio_proj], dim=1)
-                attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
-                self.last_modality_weights = attention_weights.detach()
+                # Enhance pose with information from AU/gaze
+                pose_enhanced = self.cm_pose_au(pose_encoded, au_gaze_encoded)
                 
-                # Merge all three encodings
-                merged = torch.cat([pose_encoded, au_gaze_encoded, audio_encoded], dim=2)
+                # Enhance AU/gaze with information from pose
+                au_gaze_enhanced = self.cm_au_pose(au_gaze_encoded, pose_encoded)
+                
+                # If audio is included, perform cross-modal attention with it too
+                if audio_encoded is not None:
+                    # Enhance pose with audio information
+                    pose_enhanced = self.cm_pose_audio(pose_enhanced, audio_encoded)
+                    
+                    # Enhance AU/gaze with audio information
+                    au_gaze_enhanced = self.cm_au_audio(au_gaze_enhanced, audio_encoded)
+                    
+                    # Enhance audio with pose and AU/gaze information
+                    audio_enhanced = self.cm_audio_pose(audio_encoded, pose_encoded)
+                    audio_enhanced = self.cm_audio_au(audio_enhanced, au_gaze_encoded)
+                    
+                    # Merge all three enhanced encodings
+                    merged = torch.cat([pose_enhanced, au_gaze_enhanced, audio_enhanced], dim=2)
+                else:
+                    # Merge the two enhanced encodings
+                    merged = torch.cat([pose_enhanced, au_gaze_enhanced], dim=2)
+                
+                # Apply merger
+                merged = self.merger_dropout(self.feature_merger(merged))
+                intermediates['merged'] = merged
             else:
-                # Two-way fusion
-                combined_proj = torch.cat([pose_proj, au_gaze_proj], dim=1)
-                attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
-                self.last_modality_weights = attention_weights.detach()
+                # Original attention-based fusion
+                # BALANCED FUSION: Get representations from all pathways
                 
-                # Merge the two encodings
-                merged = torch.cat([pose_encoded, au_gaze_encoded], dim=2)
-            
-            intermediates['modality_attention'] = attention_weights
-            
-            # Apply merger
-            merged = self.merger_dropout(self.feature_merger(merged))
-            intermediates['merged'] = merged
+                # Apply attention to AU/gaze features
+                au_gaze_attended = self.au_encoder.apply_attention(au_gaze_encoded)
+                
+                # Use last timestep of pose encoding
+                pose_attended = pose_encoded[:, -1, :]
+                
+                # Project representations to a common dimension
+                pose_proj = self.pose_projection(pose_attended)
+                au_gaze_proj = self.au_projection(au_gaze_attended)
+                
+                if self.include_audio and audio_encoded is not None and hasattr(self, 'audio_projection'):
+                    # Apply attention to audio features
+                    audio_attended = self.audio_encoder.apply_attention(audio_encoded)
+                    audio_proj = self.audio_projection(audio_attended)
+                    
+                    # Three-way fusion
+                    combined_proj = torch.cat([pose_proj, au_gaze_proj, audio_proj], dim=1)
+                    attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
+                    self.last_modality_weights = attention_weights.detach()
+                    
+                    # Merge all three encodings
+                    merged = torch.cat([pose_encoded, au_gaze_encoded, audio_encoded], dim=2)
+                else:
+                    # Two-way fusion
+                    combined_proj = torch.cat([pose_proj, au_gaze_proj], dim=1)
+                    attention_weights = F.softmax(self.feature_attention(combined_proj), dim=-1)
+                    self.last_modality_weights = attention_weights.detach()
+                    
+                    # Merge the two encodings
+                    merged = torch.cat([pose_encoded, au_gaze_encoded], dim=2)
+                
+                intermediates['modality_attention'] = attention_weights
+                
+                # Apply merger
+                merged = self.merger_dropout(self.feature_merger(merged))
+                intermediates['merged'] = merged
             
             # Apply global attention pooling
             attn_scores = self.global_attention(merged).squeeze(-1)
@@ -784,14 +921,29 @@ class HybridDepBinaryClassifier(nn.Module):
     
     # Feature importance methods (same as the previous implementations)
     
-    def gradient_feature_importance(self, x, target_class=1):
-        """Calculate feature importance using gradient-based attribution"""
+    def gradient_feature_importance(self, x, audio_features=None, target_class=1):
+        """
+        Calculate feature importance using gradient-based attribution
+        
+        Args:
+            x (torch.Tensor): Visual input features
+            audio_features (torch.Tensor, optional): Audio features if available
+            target_class (int): Target class for attribution (1=depressed, 0=non-depressed)
+            
+        Returns:
+            dict: Dictionary mapping feature names to importance scores
+        """
         # Set model to eval mode
         self.eval()
         x_input = x.clone().detach().requires_grad_(True)
         
+        # Clone audio features if provided and enable gradients
+        audio_input = None
+        if audio_features is not None:
+            audio_input = audio_features.clone().detach().requires_grad_(True)
+        
         # Forward pass
-        logits = self(x_input)
+        logits = self(x_input, audio_input)
         
         # Select target based on class - use logits directly
         if target_class == 1:
@@ -802,12 +954,20 @@ class HybridDepBinaryClassifier(nn.Module):
             target = -logits
         
         # Compute gradients w.r.t inputs
-        gradients = torch.autograd.grad(
-            outputs=target.sum(),
-            inputs=x_input,
-            create_graph=False,
-            retain_graph=False
-        )[0]
+        if audio_input is not None:
+            gradients, audio_gradients = torch.autograd.grad(
+                outputs=target.sum(),
+                inputs=[x_input, audio_input],
+                create_graph=False,
+                retain_graph=False
+            )
+        else:
+            gradients = torch.autograd.grad(
+                outputs=target.sum(),
+                inputs=x_input,
+                create_graph=False,
+                retain_graph=False
+            )[0]
         
         # Feature importance is the mean absolute gradient per feature
         feature_importance = torch.mean(torch.abs(gradients), dim=(0, 1)).detach().cpu().numpy()
@@ -822,11 +982,25 @@ class HybridDepBinaryClassifier(nn.Module):
             
         self.feature_importances['global']['gradient_based'] = feature_importance
         
+        # Process audio importance if available
+        audio_importance = None
+        if audio_input is not None:
+            audio_importance = torch.mean(torch.abs(audio_gradients), dim=(0, 1)).detach().cpu().numpy()
+            if np.sum(audio_importance) > 0:
+                audio_importance = audio_importance / np.sum(audio_importance)
+            self.feature_importances['global']['gradient_based_audio'] = audio_importance
+        
         # Map feature importance to feature names
         importance_dict = {
             self.feature_names[i]: feature_importance[i] 
             for i in range(min(len(self.feature_names), len(feature_importance)))
         }
+        
+        # Add audio feature importance if available
+        if audio_importance is not None and self.audio_feature_names:
+            for i, name in enumerate(self.audio_feature_names):
+                if i < len(audio_importance):
+                    importance_dict[name] = audio_importance[i]
         
         return importance_dict
     
@@ -943,16 +1117,24 @@ class HybridDepBinaryClassifier(nn.Module):
         
         return importance_dict
     
-    def instance_feature_importance(self, x):
-        """Calculate instance-specific feature importance"""
+    def instance_feature_importance(self, x, audio_features=None):
+        """Calculate instance-specific feature importance
+        
+        Args:
+            x (torch.Tensor): Visual input features
+            audio_features (torch.Tensor, optional): Audio features if available
+            
+        Returns:
+            dict: Dictionary containing prediction and feature importance
+        """
         # Get prediction
         with torch.no_grad():
-            logits = self(x)
+            logits = self(x, audio_features)
             prob = torch.sigmoid(logits)
             pred_class = 1 if prob.item() > 0.5 else 0
         
         # Calculate feature importance for predicted class
-        importance = self.integrated_gradients(x, target_class=pred_class)
+        importance = self.integrated_gradients(x, audio_features=audio_features, target_class=pred_class)
         
         # Store instance importance
         if 'instance' not in self.feature_importances:
@@ -1079,23 +1261,45 @@ class HybridDepBinaryClassifier(nn.Module):
         return plt.gcf()
     
     def get_modality_importance(self):
-        """Get relative importance of each modality (CNN, xLSTM, Audio)"""
+        """Get relative importance of each modality with context-aware labels"""
         if not hasattr(self, 'last_modality_weights'):
             return None
         
         weights = self.last_modality_weights.cpu().numpy().mean(axis=0)
         
+        # Create appropriate pathway labels based on what features are actually being processed
         if self.include_audio and hasattr(self, 'audio_encoder') and len(weights) == 3:
-            return {
-                'pose': weights[0],
-                'facial_expressions': weights[1],
-                'audio': weights[2]
-            }
+            # Three-pathway model
+            if self.include_pose and len(self.pose_indices) > 0:
+                # When pose is included, first pathway processes actual pose data
+                pathway_labels = {
+                    'pose': weights[0],
+                    'facial_expressions': weights[1],
+                    'audio': weights[2]
+                }
+            else:
+                # When pose is excluded, first pathway processes AU/gaze through xLSTM
+                pathway_labels = {
+                    'au_gaze_temporal': weights[0],  # AU/gaze through xLSTM pathway
+                    'au_gaze_spatial': weights[1],   # AU/gaze through CNN pathway
+                    'audio': weights[2]
+                }
         else:
-            return {
-                'pose': weights[0],
-                'facial_expressions': weights[1]
-            }
+            # Two-pathway model
+            if self.include_pose and len(self.pose_indices) > 0:
+                # When pose is included
+                pathway_labels = {
+                    'pose': weights[0],
+                    'facial_expressions': weights[1]
+                }
+            else:
+                # When pose is excluded
+                pathway_labels = {
+                    'au_gaze_temporal': weights[0],  # AU/gaze through xLSTM pathway
+                    'au_gaze_spatial': weights[1]    # AU/gaze through CNN pathway
+                }
+        
+        return pathway_labels
     
     def get_clinical_au_importance(self):
         """Extract importance of clinically significant Action Units"""

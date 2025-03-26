@@ -43,17 +43,19 @@ print(f"Using device: {device}")
 BATCH_SIZE = 24
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2  # Layers for both CNN and xLSTM paths
-DROPOUT = 0.3
+DROPOUT = 0.4
 POSE_DROPOUT = 0.4  
-AUDIO_DROPOUT = 0.3  # New parameter for audio dropout
+AUDIO_DROPOUT = 0.4  
 MAX_SEQ_LENGTH = 450
 LEARNING_RATE = 0.005  
-NUM_EPOCHS = 60
-EARLY_STOPPING_PATIENCE = 10
+NUM_EPOCHS = 100
+EARLY_STOPPING_PATIENCE = 15
 INCLUDE_MOVEMENT_FEATURES = True
-INCLUDE_POSE = False
-INCLUDE_AUDIO = True  # Enable audio features
-USE_HYBRID_PATHWAYS = True  # Whether to use all pathways
+INCLUDE_POSE = True
+INCLUDE_AUDIO = True  
+USE_HYBRID_PATHWAYS = True
+# New fusion type parameter - options: "attention" (original), "cross_modal"
+FUSION_TYPE = "cross_modal"
 
 # Directories
 DATA_DIR = "E-DAIC/data_extr"
@@ -79,6 +81,7 @@ config = {
     'include_pose': INCLUDE_POSE,
     'include_audio': INCLUDE_AUDIO,
     'use_hybrid_pathways': USE_HYBRID_PATHWAYS,
+    'fusion_type': FUSION_TYPE,
     'model_type': 'Hybrid CNN-xLSTM-Audio',
     'device': str(device)
 }
@@ -87,6 +90,111 @@ config = {
 with open(os.path.join(OUTPUT_DIR, 'config.txt'), 'w') as f:
     for key, value in config.items():
         f.write(f"{key}: {value}\n")
+
+def optimize_threshold(model, dev_loader):
+    """Find optimal classification threshold that maximizes F1 score on validation set"""
+    print("Optimizing classification threshold...")
+    
+    # Collect all validation predictions and labels
+    all_logits = []
+    all_labels = []
+    
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dev_loader, desc="Collecting validation predictions"):
+            features = batch['features'].to(device)
+            binary_labels = batch['binary_label']
+            
+            # Get audio features if available
+            audio_features = batch['audio_features'].to(device) if 'audio_features' in batch else None
+            
+            # Forward pass
+            logits = model(features, audio_features)
+            
+            # Collect results
+            all_logits.extend(logits.cpu().numpy())
+            all_labels.extend(binary_labels.numpy())
+    
+    # Convert to numpy arrays
+    all_logits = np.array(all_logits).flatten()
+    all_labels = np.array(all_labels).flatten()
+    
+    # Try different threshold values
+    thresholds = np.linspace(-3, 3, 61)  # Try values from -3 to 3 (logit scale) in 0.1 increments
+    f1_scores = []
+    precisions = []
+    recalls = []
+    
+    # Calculate F1 score for each threshold
+    for threshold in thresholds:
+        preds = (all_logits > threshold).astype(int)
+        
+        # Handle potential edge cases with no positive predictions
+        if np.sum(preds) == 0:
+            precision = 0
+            recall = 0
+            f1 = 0
+        else:
+            precision = np.sum((preds == 1) & (all_labels == 1)) / np.sum(preds)
+            recall = np.sum((preds == 1) & (all_labels == 1)) / np.sum(all_labels)
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        f1_scores.append(f1)
+        precisions.append(precision)
+        recalls.append(recall)
+    
+    # Find threshold with highest F1 score
+    best_idx = np.argmax(f1_scores)
+    optimal_threshold = thresholds[best_idx]
+    best_f1 = f1_scores[best_idx]
+    
+    # Convert to probability scale for interpretation
+    optimal_prob = 1 / (1 + np.exp(-optimal_threshold))
+    
+    print(f"Optimal threshold: {optimal_threshold:.4f} (probability: {optimal_prob:.4f})")
+    print(f"Validation F1 at optimal threshold: {best_f1:.4f}")
+    print(f"Precision: {precisions[best_idx]:.4f}, Recall: {recalls[best_idx]:.4f}")
+    
+    # Plot threshold vs F1 curve
+    plt.figure(figsize=(10, 6))
+    
+    # F1 score curve
+    plt.subplot(2, 1, 1)
+    plt.plot(thresholds, f1_scores, 'b-', label='F1 Score')
+    plt.axvline(x=optimal_threshold, color='r', linestyle='--')
+    plt.axvline(x=0, color='gray', linestyle=':')  # Default threshold
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Precision-Recall curve
+    plt.subplot(2, 1, 2)
+    plt.plot(thresholds, precisions, 'g-', label='Precision')
+    plt.plot(thresholds, recalls, 'm-', label='Recall')
+    plt.axvline(x=optimal_threshold, color='r', linestyle='--', label=f'Optimal ({optimal_threshold:.2f})')
+    plt.axvline(x=0, color='gray', linestyle=':', label='Default (0.00)')
+    plt.xlabel('Threshold (logit scale)')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "threshold_optimization.png"), dpi=300)
+    plt.close()
+    
+    # Save threshold info
+    threshold_info = {
+        'optimal_threshold': float(optimal_threshold),
+        'optimal_probability': float(optimal_prob),
+        'threshold_f1': float(best_f1),
+        'threshold_precision': float(precisions[best_idx]),
+        'threshold_recall': float(recalls[best_idx])
+    }
+    
+    with open(os.path.join(OUTPUT_DIR, "optimal_threshold.json"), 'w') as f:
+        json.dump(threshold_info, f, indent=4)
+    
+    return optimal_threshold
 
 def train():
     # Get dataloaders
@@ -121,7 +229,7 @@ def train():
         feature_names = [f"feature_{i}" for i in range(input_size)]
         audio_feature_names = []
     
-    # Initialize model
+    # Initialize model with new fusion type parameter
     model = HybridDepBinaryClassifier(
         input_size=input_size,
         hidden_size=HIDDEN_SIZE,
@@ -134,7 +242,8 @@ def train():
         audio_feature_names=audio_feature_names,
         include_pose=INCLUDE_POSE,
         include_audio=INCLUDE_AUDIO,
-        use_hybrid_pathways=USE_HYBRID_PATHWAYS
+        use_hybrid_pathways=USE_HYBRID_PATHWAYS,
+        fusion_type=FUSION_TYPE  # Pass new fusion_type parameter
     ).to(device)
     
     # Calculate class weights based on class distribution (24% depressed, 76% non-depressed)
@@ -345,8 +454,11 @@ def train():
     # Load best model for evaluation
     model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "best_model.pt")))
     
-    # Evaluate on test set
-    evaluate_model(model, test_loader)
+    # Optimize threshold on validation set
+    optimal_threshold = optimize_threshold(model, dev_loader)
+    
+    # Evaluate on test set with optimized threshold
+    evaluate_model(model, test_loader, optimal_threshold)
     
     # Analyze feature importance
     analyze_feature_importance(model, test_loader)
@@ -395,9 +507,11 @@ def plot_training_history(history):
     plt.savefig(os.path.join(OUTPUT_DIR, "training_history.png"), dpi=300)
     plt.close()
 
-def evaluate_model(model, test_loader):
-    """Evaluate model on test set and generate reports"""
+def evaluate_model(model, test_loader, threshold=0.0):
+    """Evaluate model on test set and generate reports using specified threshold"""
     model.eval()
+    
+    print(f"Evaluating model with threshold = {threshold:.4f}")
     
     all_predictions = []
     all_logits = []
@@ -433,53 +547,100 @@ def evaluate_model(model, test_loader):
     all_predictions = np.array(all_predictions).flatten()
     all_labels = np.array(all_labels).flatten()
     
-    # Calculate metrics - use probabilities for threshold-based metrics
-    binary_preds = (all_predictions > 0.5).astype(int)
+    # Calculate metrics using the optimized threshold
+    binary_preds = (all_logits > threshold).astype(int)
     
-    # Calculate ROC AUC
+    # For reference, also calculate metrics with default threshold (0.0)
+    default_preds = (all_logits > 0.0).astype(int)
+    
+    # Calculate ROC AUC (threshold-independent)
     auc = roc_auc_score(all_labels, all_predictions)
     
-    # Calculate confusion matrix
+    # Calculate confusion matrices for both thresholds
     cm = confusion_matrix(all_labels, binary_preds)
+    cm_default = confusion_matrix(all_labels, default_preds)
     
-    # Plot confusion matrix
+    # Plot confusion matrix with optimized threshold
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Non-depressed', 'Depressed'],
                 yticklabels=['Non-depressed', 'Depressed'])
-    plt.title('Confusion Matrix')
+    plt.title(f'Confusion Matrix (Threshold = {threshold:.4f})')
     plt.xlabel('Predicted')
     plt.ylabel('Actual')
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, "confusion_matrix.png"), dpi=300)
     plt.close()
     
-    # Generate classification report
+    # Generate classification reports for both thresholds
     report = classification_report(all_labels, binary_preds, 
                                  target_names=['Non-depressed', 'Depressed'],
                                  output_dict=True)
     
-    # Save report as CSV
+    report_default = classification_report(all_labels, default_preds, 
+                                         target_names=['Non-depressed', 'Depressed'],
+                                         output_dict=True)
+    
+    # Save optimized threshold report as CSV
     report_df = pd.DataFrame(report).transpose()
     report_df.to_csv(os.path.join(OUTPUT_DIR, "classification_report.csv"))
     
-    # Print report
+    # Compare the two thresholds (optimal vs. default)
+    threshold_comparison = {
+        'optimal_threshold': {
+            'threshold': threshold,
+            'accuracy': report['accuracy'],
+            'precision': report['Depressed']['precision'],
+            'recall': report['Depressed']['recall'],
+            'f1': report['Depressed']['f1-score'],
+            'confusion_matrix': cm.tolist()
+        },
+        'default_threshold': {
+            'threshold': 0.0,
+            'accuracy': report_default['accuracy'],
+            'precision': report_default['Depressed']['precision'],
+            'recall': report_default['Depressed']['recall'],
+            'f1': report_default['Depressed']['f1-score'],
+            'confusion_matrix': cm_default.tolist()
+        },
+        'improvement': {
+            'accuracy': report['accuracy'] - report_default['accuracy'],
+            'precision': report['Depressed']['precision'] - report_default['Depressed']['precision'],
+            'recall': report['Depressed']['recall'] - report_default['Depressed']['recall'],
+            'f1': report['Depressed']['f1-score'] - report_default['Depressed']['f1-score']
+        }
+    }
+    
+    # Save threshold comparison to JSON
+    with open(os.path.join(OUTPUT_DIR, "threshold_comparison.json"), 'w') as f:
+        json.dump(threshold_comparison, f, indent=4)
+    
+    # Print report (for optimized threshold)
     print("\nTest Set Evaluation:")
+    print(f"  Using optimized threshold: {threshold:.4f}")
     print(f"  Accuracy: {report['accuracy']:.4f}")
     print(f"  Precision (Depressed): {report['Depressed']['precision']:.4f}")
     print(f"  Recall (Depressed): {report['Depressed']['recall']:.4f}")
     print(f"  F1 Score (Depressed): {report['Depressed']['f1-score']:.4f}")
     print(f"  ROC AUC: {auc:.4f}")
     
-    # Create test metrics JSON
+    print("\nImprovement over default threshold:")
+    print(f"  Accuracy: {threshold_comparison['improvement']['accuracy']:.4f}")
+    print(f"  Precision: {threshold_comparison['improvement']['precision']:.4f}")
+    print(f"  Recall: {threshold_comparison['improvement']['recall']:.4f}")
+    print(f"  F1 Score: {threshold_comparison['improvement']['f1']:.4f}")
+    
+    # Create test metrics JSON (using optimized threshold)
     test_metrics = {
+        'threshold': float(threshold),
         'accuracy': report['accuracy'],
         'precision_depressed': report['Depressed']['precision'],
         'recall_depressed': report['Depressed']['recall'],
         'f1_depressed': report['Depressed']['f1-score'],
         'roc_auc': auc,
         'confusion_matrix': cm.tolist(),
-        'classification_report': report
+        'classification_report': report,
+        'threshold_comparison': threshold_comparison
     }
     
     # Save test metrics to JSON file
@@ -489,13 +650,14 @@ def evaluate_model(model, test_loader):
     
     print(f"  Test metrics saved to: {metrics_path}")
     
-    # Prepare results DataFrame with both logits and probabilities
+    # Prepare results DataFrame with both logits, probabilities, and both threshold predictions
     results_dict = {
         'Participant_ID': all_participant_ids,
         'True_Label': all_labels,
         'Logits': all_logits,
         'Predicted_Prob': all_predictions,
-        'Predicted_Label': binary_preds
+        'Predicted_Label_Default': default_preds,
+        'Predicted_Label_Optimized': binary_preds
     }
     
     # Add PHQ scores if available
@@ -581,6 +743,37 @@ def analyze_feature_importance(model, test_loader):
     importance_values = list(importance_dict.values())
     print(f"Feature importance stats: min={min(importance_values):.6f}, max={max(importance_values):.6f}")
     
+    # Save global feature importance to JSON
+    global_importance_sorted = {k: float(v) for k, v in 
+                              sorted(importance_dict.items(), 
+                                    key=lambda item: item[1], 
+                                    reverse=True)}
+    
+    # Add metadata
+    global_importance_json = {
+        'importance_scores': global_importance_sorted,
+        'metadata': {
+            'method': 'integrated_gradients',
+            'timestamp': datetime.now().isoformat(),
+            'model_config': {
+                'include_pose': model.include_pose,
+                'include_audio': model.include_audio,
+                'use_hybrid_pathways': model.use_hybrid_pathways
+            },
+            'top_features': list(global_importance_sorted.keys())[:20],
+            'statistics': {
+                'min': float(min(importance_values)),
+                'max': float(max(importance_values)),
+                'mean': float(np.mean(importance_values)),
+                'median': float(np.median(importance_values))
+            }
+        }
+    }
+    
+    # Save to JSON file
+    with open(os.path.join(OUTPUT_DIR, "global_feature_importance.json"), 'w') as f:
+        json.dump(global_importance_json, f, indent=4)
+    
     # Visualize global feature importance
     print("Visualizing feature importance...")
     model.visualize_feature_importance(
@@ -615,29 +808,68 @@ def analyze_feature_importance(model, test_loader):
     # Get modality importance if available
     modality_importance = model.get_modality_importance()
     if modality_importance:
+        # Define consistent colors for modality types
+        color_map = {
+            'pose': 'green', 
+            'facial_expressions': 'blue',
+            'audio': 'purple',
+            'au_gaze_temporal': 'orange',  # For AU/gaze through xLSTM
+            'au_gaze_spatial': 'blue'      # For AU/gaze through CNN
+        }
+        
+        # Get colors for the current modalities
+        colors = [color_map.get(modality, 'gray') for modality in modality_importance.keys()]
+        
+        # Create descriptive labels for the plot
+        label_map = {
+            'pose': 'Pose (xLSTM)',
+            'facial_expressions': 'Facial Expressions (CNN)', 
+            'audio': 'Audio (xLSTM)',
+            'au_gaze_temporal': 'AU/Gaze Temporal (xLSTM)',
+            'au_gaze_spatial': 'AU/Gaze Spatial (CNN)'
+        }
+        
+        # Map keys to more descriptive labels for visualization
+        plot_labels = [label_map.get(modality, modality) for modality in modality_importance.keys()]
+        
         # Plot modality importance
-        plt.figure(figsize=(8, 6))
-        plt.bar(modality_importance.keys(), modality_importance.values(), color=['green', 'blue', 'purple'])
+        plt.figure(figsize=(10, 6))
+        plt.bar(plot_labels, modality_importance.values(), color=colors)
         plt.xlabel('Modality')
         plt.ylabel('Relative Importance')
-        plt.title('Relative Importance of Different Modalities')
+        plt.title('Relative Importance of Different Pathways')
+        plt.xticks(rotation=15)
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, "modality_importance.png"), dpi=300)
         plt.close()
         
+        # Create a copy of modality_importance with original keys for JSON serialization
+        # Convert NumPy float32 values to native Python floats for JSON serialization
+        modality_importance_json = {k: float(v) for k, v in modality_importance.items()}
+        
+        # Also include descriptive labels in the JSON
+        modality_importance_json_with_labels = {
+            'importance': modality_importance_json,
+            'descriptive_labels': {k: label_map.get(k, k) for k in modality_importance.keys()}
+        }
+        
         # Save modality importance to file
         with open(os.path.join(OUTPUT_DIR, "modality_importance.json"), 'w') as f:
-            import json
-            json.dump(modality_importance, f, indent=4)
+            json.dump(modality_importance_json_with_labels, f, indent=4)
     
     # Try gradient-based method too for comparison
     print("Calculating gradient-based importance...")
-    grad_importance = model.gradient_feature_importance(single_example)
+    single_audio_features = audio_features[0:1] if audio_features is not None else None
+    grad_importance = model.gradient_feature_importance(
+        single_example, 
+        audio_features=single_audio_features
+    )
+    
     model.visualize_feature_importance(
         importance_dict=grad_importance,
         top_k=20,
         save_path=os.path.join(OUTPUT_DIR, "gradient_based_importance.png"),
-        title="Gradient-Based Feature Importance (CNN Model)"
+        title="Gradient-Based Feature Importance (Hybrid Model)"
     )
     
     # Extract and visualize importance of clinically significant AUs
@@ -674,11 +906,15 @@ def analyze_feature_importance(model, test_loader):
     # Find examples of each class
     for batch in test_loader:
         labels = batch['binary_label'].numpy().flatten()
+        # Check for audio features in the batch
+        batch_audio = batch['audio_features'].to(device) if 'audio_features' in batch else None
+        
         if 1 in labels and depressed_batch is None:
             # Get first depressed example
             idx = np.where(labels == 1)[0][0]
             depressed_batch = {
                 'features': batch['features'][idx:idx+1].to(device),
+                'audio_features': batch_audio[idx:idx+1] if batch_audio is not None else None,
                 'participant_id': batch['participant_id'][idx],
                 'phq_score': batch['phq_score'][idx].item() if 'phq_score' in batch else 'N/A'
             }
@@ -688,6 +924,7 @@ def analyze_feature_importance(model, test_loader):
             idx = np.where(labels == 0)[0][0]
             non_depressed_batch = {
                 'features': batch['features'][idx:idx+1].to(device),
+                'audio_features': batch_audio[idx:idx+1] if batch_audio is not None else None,
                 'participant_id': batch['participant_id'][idx],
                 'phq_score': batch['phq_score'][idx].item() if 'phq_score' in batch else 'N/A'
             }
@@ -697,7 +934,10 @@ def analyze_feature_importance(model, test_loader):
     
     # Analyze depressed example
     if depressed_batch is not None:
-        dep_importance = model.instance_feature_importance(depressed_batch['features'])
+        dep_importance = model.instance_feature_importance(
+            depressed_batch['features'], 
+            depressed_batch['audio_features']
+        )
         
         phq_info = f" (PHQ-8: {depressed_batch['phq_score']})" if depressed_batch['phq_score'] != 'N/A' else ""
         
@@ -710,7 +950,10 @@ def analyze_feature_importance(model, test_loader):
     
     # Analyze non-depressed example
     if non_depressed_batch is not None:
-        nondep_importance = model.instance_feature_importance(non_depressed_batch['features'])
+        nondep_importance = model.instance_feature_importance(
+            non_depressed_batch['features'],
+            non_depressed_batch['audio_features']
+        )
         
         phq_info = f" (PHQ-8: {non_depressed_batch['phq_score']})" if non_depressed_batch['phq_score'] != 'N/A' else ""
         
@@ -723,15 +966,17 @@ def analyze_feature_importance(model, test_loader):
     
     # Compare feature importance between depressed and non-depressed participants
     if depressed_batch is not None and non_depressed_batch is not None:
-        compare_feature_importance(
+        comparison_data = compare_feature_importance(
             dep_importance['importance'],
             nondep_importance['importance'],
             depressed_batch['participant_id'],
             non_depressed_batch['participant_id'],
-            save_path=os.path.join(OUTPUT_DIR, "feature_importance_comparison.png")
+            save_path=os.path.join(OUTPUT_DIR, "feature_importance_comparison.png"),
+            save_json=True,  # Add parameter to save JSON
+            output_dir=OUTPUT_DIR  # Pass output directory
         )
 
-def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep_id, save_path=None):
+def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep_id, save_path=None, save_json=False, output_dir=None):
     """Compare feature importance between depressed and non-depressed participants"""
     # Get top 10 features for each
     dep_top = dict(sorted(dep_importance.items(), key=lambda x: x[1], reverse=True)[:10])
@@ -752,6 +997,30 @@ def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep
     dep_values = [dep_values[i] for i in sorted_indices]
     nondep_values = [nondep_values[i] for i in sorted_indices]
     
+    # Create comparison data dictionary
+    comparison_data = {
+        'features': all_features,
+        'depressed': {
+            'participant_id': dep_id,
+            'importance_values': [float(val) for val in dep_values]
+        },
+        'non_depressed': {
+            'participant_id': nondep_id,
+            'importance_values': [float(val) for val in nondep_values]
+        },
+        'metadata': {
+            'timestamp': datetime.now().isoformat(),
+            'method': 'integrated_gradients_instance'
+        }
+    }
+    
+    # Save to JSON if requested
+    if save_json and output_dir:
+        json_path = os.path.join(output_dir, "feature_importance_comparison.json")
+        with open(json_path, 'w') as f:
+            json.dump(comparison_data, f, indent=4)
+            print(f"Feature importance comparison saved to: {json_path}")
+    
     # Plot comparison
     plt.figure(figsize=(12, 8))
     x = np.arange(len(all_features))
@@ -771,6 +1040,8 @@ def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
+    
+    return comparison_data  # Return the data for potential further use
 
 if __name__ == "__main__":
     train()
