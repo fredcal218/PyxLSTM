@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_auc_score, confusion_matrix, classification_report
+from sklearn.metrics import roc_auc_score, confusion_matrix, classification_report, precision_recall_curve, f1_score
 import seaborn as sns
 from tqdm import tqdm
 import time
@@ -41,20 +41,23 @@ print(f"Using device: {device}")
 
 # Hyperparameters
 BATCH_SIZE = 24
-HIDDEN_SIZE = 128
+HIDDEN_SIZE = 256
 NUM_LAYERS = 3  # Number of CNN layers
 DROPOUT = 0.3
-MAX_SEQ_LENGTH = 450  # Keep this for now as we're focusing on architecture changes
+MAX_SEQ_LENGTH = 750  
 LEARNING_RATE = 0.001  # Reduced from 0.01 to 0.001 for stability
 WEIGHT_DECAY = 1e-5    # Added weight decay for regularization
 NUM_EPOCHS = 50
 EARLY_STOPPING_PATIENCE = 15
-INCLUDE_MOVEMENT_FEATURES = False  # Simplified model doesn't need movement features
-INCLUDE_POSE = True  # Keep all features, but process them in a simplified way
+INCLUDE_MOVEMENT_FEATURES = False  
+INCLUDE_POSE = False  
 POSE_SCALING_FACTOR = 0.1  # More aggressive scaling (reduced from 0.2 to 0.1)
-POSE_REG_STRENGTH = 0.2  # Increased from 0.01 to 0.02 for stronger regularization
+POSE_REG_STRENGTH = 0.5  # Increased from 0.01 to 0.02 for stronger regularization
 LR_PATIENCE = 4  # Epochs to wait before reducing learning rate
 LR_FACTOR = 0.5  # Factor to reduce learning rate by
+LOSS_TYPE = 'focal'    # Options: 'bce', 'focal'
+FOCAL_GAMMA = 2.0      # Focal loss focusing parameter
+FOCAL_ALPHA = 0.75     # Focal loss alpha parameter for positive class weight
 
 # Directories
 DATA_DIR = "E-DAIC/data_extr"
@@ -82,13 +85,69 @@ config = {
     'pose_scaling_factor': POSE_SCALING_FACTOR,
     'pose_reg_strength': POSE_REG_STRENGTH,
     'model_type': 'CNN',  # Changed from LSTM
-    'device': str(device)
+    'device': str(device),
+    'loss_type': LOSS_TYPE,
+    'focal_gamma': FOCAL_GAMMA,
+    'focal_alpha': FOCAL_ALPHA
 }
 
 # Save configuration
 with open(os.path.join(OUTPUT_DIR, 'config.txt'), 'w') as f:
     for key, value in config.items():
         f.write(f"{key}: {value}\n")
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss implementation for binary classification.
+    
+    This loss helps focus more on hard examples and less on easy ones by adding
+    a modulating factor to standard cross entropy.
+    
+    Args:
+        alpha (float): Weight for the positive class (between 0-1)
+        gamma (float): Focusing parameter (>= 0). Higher values increase focus on hard examples.
+        reduction (str): Reduction method ('mean', 'sum', or 'none')
+    """
+    def __init__(self, alpha=0.75, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.eps = 1e-7  # Small epsilon to avoid log(0) issues
+    
+    def forward(self, inputs, targets):
+        """
+        Calculate focal loss
+        
+        Args:
+            inputs (torch.Tensor): Raw logits from the model (not sigmoid-activated)
+            targets (torch.Tensor): Target labels (0 or 1)
+            
+        Returns:
+            torch.Tensor: Focal loss value
+        """
+        # Convert logits to probabilities
+        probs = torch.sigmoid(inputs)
+        
+        # Calculate binary cross entropy loss
+        # For numerical stability, we use the built-in binary_cross_entropy_with_logits later
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        
+        # Calculate the focal weight
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal_weight = alpha_t * (1 - p_t).pow(self.gamma)
+        
+        # Apply the weight to BCE loss
+        focal_loss = focal_weight * bce_loss
+        
+        # Apply reduction
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:  # 'none'
+            return focal_loss
 
 def train():
     # Get dataloaders
@@ -130,12 +189,16 @@ def train():
         pose_scaling_factor=POSE_SCALING_FACTOR
     ).to(device)
     
-    # Calculate class weights based on class distribution (24% depressed, 76% non-depressed)
-    # Weight for positive class: 76/24 ≈ 3.16
-    pos_weight = torch.tensor([3.16]).to(device)
-    
-    # Define loss function with class weighting
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Choose loss function based on configuration
+    if LOSS_TYPE == 'focal':
+        # Use Focal Loss with specified parameters
+        criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
+        print(f"Using Focal Loss with gamma={FOCAL_GAMMA}, alpha={FOCAL_ALPHA}")
+    else:
+        # Default to BCE with Logits Loss with class weighting
+        pos_weight = torch.tensor([3.16]).to(device)  # Class weight: 76/24 ≈ 3.16
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        print(f"Using BCE Loss with positive class weight={pos_weight.item()}")
     
     # Optimizer with weight decay
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -268,9 +331,9 @@ def train():
         current_lr = optimizer.param_groups[0]['lr']
         history['learning_rate'].append(current_lr)
         
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Time: {epoch_time:.2f}s")
-        print(f"  Train Loss: {train_loss:.4f}, Acc: {train_metrics['accuracy']:.4f}, F1: {train_metrics['f1']:.4f}")
-        print(f"  Val Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']:.4f}, F1: {val_metrics['f1']:.4f}")
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Time: {epoch_time:.2f}s (Loss: {LOSS_TYPE.upper()})")
+        print(f"  Train Loss: {train_loss:.4f}, Acc: {train_metrics['accuracy']:.4f}, F1: {train_metrics['f1']:.4f}, Prec: {train_metrics['precision']:.4f}, Rec: {train_metrics['recall']:.4f}")
+        print(f"  Val Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']:.4f}, F1: {val_metrics['f1']:.4f}, Prec: {val_metrics['precision']:.4f}, Rec: {val_metrics['recall']:.4f}")
         print(f"  Learning Rate: {current_lr:.6f}")
         
         # If we're using pose features, log their weights
@@ -340,8 +403,11 @@ def train():
     # Load best model for evaluation
     model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "best_model.pt")))
     
-    # Evaluate on test set
-    evaluate_model(model, test_loader)
+    # Find optimal threshold on validation set
+    optimal_threshold = find_optimal_threshold(model, dev_loader)
+    
+    # Evaluate on test set with optimal threshold
+    evaluate_model(model, test_loader, threshold=optimal_threshold)
     
     # Analyze feature importance
     analyze_feature_importance(model, test_loader)
@@ -421,7 +487,7 @@ def plot_training_history(history):
         plt.savefig(os.path.join(OUTPUT_DIR, "feature_weights_history.png"), dpi=300)
         plt.close()
 
-def evaluate_model(model, test_loader):
+def evaluate_model(model, test_loader, threshold=0.5):
     """Evaluate model on test set and generate reports"""
     model.eval()
     
@@ -457,7 +523,7 @@ def evaluate_model(model, test_loader):
     all_labels = np.array(all_labels).flatten()
     
     # Calculate metrics - use probabilities for threshold-based metrics
-    binary_preds = (all_predictions > 0.5).astype(int)
+    binary_preds = (all_predictions > threshold).astype(int)
     
     # Calculate ROC AUC
     auc = roc_auc_score(all_labels, all_predictions)
@@ -470,7 +536,7 @@ def evaluate_model(model, test_loader):
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Non-depressed', 'Depressed'],
                 yticklabels=['Non-depressed', 'Depressed'])
-    plt.title('Confusion Matrix')
+    plt.title(f'Confusion Matrix (Threshold = {threshold:.4f})')
     plt.xlabel('Predicted')
     plt.ylabel('Actual')
     plt.tight_layout()
@@ -488,6 +554,7 @@ def evaluate_model(model, test_loader):
     
     # Print report
     print("\nTest Set Evaluation:")
+    print(f"  Using threshold: {threshold:.4f}")
     print(f"  Accuracy: {report['accuracy']:.4f}")
     print(f"  Precision (Depressed): {report['Depressed']['precision']:.4f}")
     print(f"  Recall (Depressed): {report['Depressed']['recall']:.4f}")
@@ -496,6 +563,7 @@ def evaluate_model(model, test_loader):
     
     # Create test metrics JSON
     test_metrics = {
+        'threshold': float(threshold),
         'accuracy': report['accuracy'],
         'precision_depressed': report['Depressed']['precision'],
         'recall_depressed': report['Depressed']['recall'],
@@ -532,6 +600,9 @@ def evaluate_model(model, test_loader):
     # Save predictions to CSV
     results_df = pd.DataFrame(results_dict)
     results_df.to_csv(os.path.join(OUTPUT_DIR, "test_predictions.csv"), index=False)
+    
+    # Plot probability distribution for both classes
+    plot_probability_distribution(all_predictions, all_labels, threshold)
 
 def plot_score_analysis(phq_scores, true_labels, pred_labels):
     """Plot analysis of predictions by PHQ score (if available)"""
@@ -600,6 +671,23 @@ def analyze_feature_importance(model, test_loader):
     importance_values = list(importance_dict.values())
     print(f"Feature importance stats: min={min(importance_values):.6f}, max={max(importance_values):.6f}")
     
+    # Save feature importance values to JSON
+    importance_json_path = os.path.join(OUTPUT_DIR, "global_feature_importance.json")
+    with open(importance_json_path, 'w') as f:
+        # Sort by importance value in descending order and convert numpy values to native Python types
+        sorted_importance = {}
+        for k, v in sorted(importance_dict.items(), key=lambda item: item[1], reverse=True):
+            # Convert any numpy values to native Python types
+            if isinstance(v, np.floating):
+                sorted_importance[k] = float(v)
+            elif isinstance(v, np.integer):
+                sorted_importance[k] = int(v)
+            else:
+                sorted_importance[k] = v
+                
+        json.dump(sorted_importance, f, indent=4)
+    print(f"Feature importance values saved to {importance_json_path}")
+    
     # Visualize global feature importance
     print("Visualizing feature importance...")
     model.visualize_feature_importance(
@@ -612,6 +700,22 @@ def analyze_feature_importance(model, test_loader):
     # Try gradient-based method too for comparison
     print("Calculating gradient-based importance...")
     grad_importance = model.gradient_feature_importance(single_example)
+    
+    # Save gradient-based importance to JSON
+    grad_importance_json_path = os.path.join(OUTPUT_DIR, "gradient_based_importance.json")
+    with open(grad_importance_json_path, 'w') as f:
+        # Sort by importance value in descending order and convert numpy values to native Python types
+        sorted_grad_importance = {}
+        for k, v in sorted(grad_importance.items(), key=lambda item: item[1], reverse=True):
+            if isinstance(v, np.floating):
+                sorted_grad_importance[k] = float(v)
+            elif isinstance(v, np.integer):
+                sorted_grad_importance[k] = int(v)
+            else:
+                sorted_grad_importance[k] = v
+                
+        json.dump(sorted_grad_importance, f, indent=4)
+    
     model.visualize_feature_importance(
         importance_dict=grad_importance,
         top_k=20,
@@ -640,7 +744,7 @@ def analyze_feature_importance(model, test_loader):
     # Save clinical importance to CSV
     clinical_df = pd.DataFrame({
         'AU': list(clinical_importance.keys()),
-        'Importance': list(clinical_importance.values())
+        'Importance': [float(v) if isinstance(v, np.floating) else v for v in clinical_importance.values()]
     })
     clinical_df.to_csv(os.path.join(OUTPUT_DIR, "clinical_au_importance.csv"), index=False)
     
@@ -680,6 +784,30 @@ def analyze_feature_importance(model, test_loader):
         
         phq_info = f" (PHQ-8: {depressed_batch['phq_score']})" if depressed_batch['phq_score'] != 'N/A' else ""
         
+        # Save instance-specific importance to JSON
+        dep_json_path = os.path.join(OUTPUT_DIR, f"instance_importance_depressed_{depressed_batch['participant_id']}.json")
+        with open(dep_json_path, 'w') as f:
+            # Convert numpy values to native Python types
+            sorted_dep_importance = {}
+            for k, v in sorted(dep_importance['importance'].items(), key=lambda item: item[1], reverse=True):
+                if isinstance(v, np.floating):
+                    sorted_dep_importance[k] = float(v)
+                elif isinstance(v, np.integer):
+                    sorted_dep_importance[k] = int(v)
+                else:
+                    sorted_dep_importance[k] = v
+            
+            # Create JSON object with properly converted values
+            json_data = {
+                'participant_id': depressed_batch['participant_id'],
+                'phq_score': float(depressed_batch['phq_score']) if isinstance(depressed_batch['phq_score'], np.floating) else depressed_batch['phq_score'],
+                'prediction': float(dep_importance['prediction']) if isinstance(dep_importance['prediction'], np.floating) else dep_importance['prediction'],
+                'predicted_class': int(dep_importance['predicted_class']) if isinstance(dep_importance['predicted_class'], np.integer) else dep_importance['predicted_class'],
+                'feature_importance': sorted_dep_importance
+            }
+            
+            json.dump(json_data, f, indent=4)
+        
         model.visualize_feature_importance(
             importance_dict=dep_importance['importance'],
             top_k=15,
@@ -692,6 +820,30 @@ def analyze_feature_importance(model, test_loader):
         nondep_importance = model.instance_feature_importance(non_depressed_batch['features'])
         
         phq_info = f" (PHQ-8: {non_depressed_batch['phq_score']})" if non_depressed_batch['phq_score'] != 'N/A' else ""
+        
+        # Save instance-specific importance to JSON
+        nondep_json_path = os.path.join(OUTPUT_DIR, f"instance_importance_nondepressed_{non_depressed_batch['participant_id']}.json")
+        with open(nondep_json_path, 'w') as f:
+            # Convert numpy values to native Python types
+            sorted_nondep_importance = {}
+            for k, v in sorted(nondep_importance['importance'].items(), key=lambda item: item[1], reverse=True):
+                if isinstance(v, np.floating):
+                    sorted_nondep_importance[k] = float(v)
+                elif isinstance(v, np.integer):
+                    sorted_nondep_importance[k] = int(v)
+                else:
+                    sorted_nondep_importance[k] = v
+            
+            # Create JSON object with properly converted values
+            json_data = {
+                'participant_id': non_depressed_batch['participant_id'],
+                'phq_score': float(non_depressed_batch['phq_score']) if isinstance(non_depressed_batch['phq_score'], np.floating) else non_depressed_batch['phq_score'],
+                'prediction': float(nondep_importance['prediction']) if isinstance(nondep_importance['prediction'], np.floating) else nondep_importance['prediction'],
+                'predicted_class': int(nondep_importance['predicted_class']) if isinstance(nondep_importance['predicted_class'], np.integer) else nondep_importance['predicted_class'],
+                'feature_importance': sorted_nondep_importance
+            }
+            
+            json.dump(json_data, f, indent=4)
         
         model.visualize_feature_importance(
             importance_dict=nondep_importance['importance'],
@@ -715,6 +867,57 @@ def analyze_feature_importance(model, test_loader):
         print("Visualizing feature group weights...")
         model.visualize_feature_group_weights(
             save_path=os.path.join(OUTPUT_DIR, "feature_group_weights.png")
+        )
+    
+    # Visualize temporal attention for a few examples
+    print("Visualizing temporal attention patterns...")
+    
+    # Find one example of each class for attention visualization
+    depressed_idx = None
+    non_depressed_idx = None
+    
+    for i, label in enumerate(labels):
+        if label == 1 and depressed_idx is None:
+            depressed_idx = i
+        elif label == 0 and non_depressed_idx is None:
+            non_depressed_idx = i
+            
+        if depressed_idx is not None and non_depressed_idx is not None:
+            break
+    
+    # Visualize temporal attention for depressed example
+    if depressed_idx is not None:
+        print(f"Generating temporal attention visualization for depressed example...")
+        dep_features = features[depressed_idx:depressed_idx+1]
+        model.visualize_temporal_attention(
+            dep_features,
+            save_path=os.path.join(OUTPUT_DIR, "temporal_attention_depressed.png")
+        )
+    
+    # Visualize temporal attention for non-depressed example
+    if non_depressed_idx is not None:
+        print(f"Generating temporal attention visualization for non-depressed example...")
+        nondep_features = features[non_depressed_idx:non_depressed_idx+1]
+        model.visualize_temporal_attention(
+            nondep_features, 
+            save_path=os.path.join(OUTPUT_DIR, "temporal_attention_non_depressed.png")
+        )
+    
+    # Add temporal attention visualization to instance-specific analysis
+    if depressed_batch is not None:
+        # In addition to existing feature importance analysis
+        print("Generating temporal attention for depressed instance...")
+        model.visualize_temporal_attention(
+            depressed_batch['features'],
+            save_path=os.path.join(OUTPUT_DIR, f"temporal_attention_depressed_{depressed_batch['participant_id']}.png")
+        )
+    
+    if non_depressed_batch is not None:
+        # In addition to existing feature importance analysis
+        print("Generating temporal attention for non-depressed instance...")
+        model.visualize_temporal_attention(
+            non_depressed_batch['features'],
+            save_path=os.path.join(OUTPUT_DIR, f"temporal_attention_non_depressed_{non_depressed_batch['participant_id']}.png")
         )
 
 def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep_id, save_path=None):
@@ -757,6 +960,154 @@ def compare_feature_importance(dep_importance, nondep_importance, dep_id, nondep
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
+
+def find_optimal_threshold(model, val_loader):
+    """
+    Find the optimal classification threshold that maximizes F1 score on validation set
+    
+    Args:
+        model (nn.Module): Trained model
+        val_loader (DataLoader): Validation data loader
+        
+    Returns:
+        float: Optimal threshold for maximizing F1 score
+    """
+    model.eval()
+    
+    # Collect all predictions and labels
+    all_logits = []
+    all_probs = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Finding optimal threshold"):
+            features = batch['features'].to(device)
+            binary_labels = batch['binary_label']
+            
+            # Forward pass
+            logits = model(features)
+            probs = torch.sigmoid(logits)
+            
+            # Collect results
+            all_logits.extend(logits.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(binary_labels.numpy())
+    
+    # Convert to numpy arrays
+    all_probs = np.array(all_probs).flatten()
+    all_labels = np.array(all_labels).flatten()
+    
+    # Find the best threshold using precision-recall curve
+    precisions, recalls, thresholds = precision_recall_curve(all_labels, all_probs)
+    
+    # Calculate F1 score for each threshold
+    f1_scores = []
+    for i in range(len(thresholds)):
+        if precisions[i] + recalls[i] > 0:  # Avoid division by zero
+            f1 = 2 * precisions[i] * recalls[i] / (precisions[i] + recalls[i])
+            f1_scores.append(f1)
+        else:
+            f1_scores.append(0)
+    
+    # Find threshold that maximizes F1 score
+    best_idx = np.argmax(f1_scores)
+    best_threshold = thresholds[best_idx]
+    best_f1 = f1_scores[best_idx]
+    
+    # Get metrics at this threshold
+    binary_preds = (all_probs >= best_threshold).astype(int)
+    report = classification_report(all_labels, binary_preds, 
+                                  target_names=['Non-depressed', 'Depressed'],
+                                  output_dict=True)
+    
+    print(f"\nOptimal Threshold Analysis:")
+    print(f"  Best Threshold: {best_threshold:.4f}")
+    print(f"  Validation F1 (Depressed): {best_f1:.4f}")
+    print(f"  Validation Precision (Depressed): {report['Depressed']['precision']:.4f}")
+    print(f"  Validation Recall (Depressed): {report['Depressed']['recall']:.4f}")
+    
+    # Plot precision-recall curve with optimal threshold
+    plt.figure(figsize=(10, 6))
+    plt.plot(recalls, precisions, 'b-', label='Precision-Recall curve')
+    plt.plot(recalls[best_idx], precisions[best_idx], 'ro', 
+             label=f'Optimal threshold = {best_threshold:.4f}, F1 = {best_f1:.4f}')
+    
+    # Add default threshold of 0.5 for comparison
+    default_idx = np.abs(thresholds - 0.5).argmin()
+    default_f1 = f1_scores[default_idx]
+    plt.plot(recalls[default_idx], precisions[default_idx], 'go',
+             label=f'Default threshold = 0.5, F1 = {default_f1:.4f}')
+    
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve with Optimal Threshold')
+    plt.legend(loc='lower left')
+    plt.grid(True)
+    plt.savefig(os.path.join(OUTPUT_DIR, "threshold_optimization.png"), dpi=300)
+    plt.close()
+    
+    # Save threshold and metrics to file
+    threshold_data = {
+        'optimal_threshold': float(best_threshold),
+        'default_threshold': 0.5,
+        'optimal_f1': float(best_f1),
+        'default_f1': float(default_f1),
+        'improvement': float(best_f1 - default_f1),
+        'precision_at_optimal': float(report['Depressed']['precision']),
+        'recall_at_optimal': float(report['Depressed']['recall']),
+        'threshold_values': [float(t) for t in thresholds.tolist()],
+        'precision_values': [float(p) for p in precisions.tolist()],
+        'recall_values': [float(r) for r in recalls.tolist()],
+        'f1_values': [float(f) for f in f1_scores]
+    }
+    
+    with open(os.path.join(OUTPUT_DIR, "threshold_optimization.json"), 'w') as f:
+        json.dump(threshold_data, f, indent=4)
+    
+    return best_threshold
+
+def plot_probability_distribution(predictions, labels, threshold):
+    """Plot the distribution of predicted probabilities for each class"""
+    plt.figure(figsize=(10, 6))
+    
+    # Get predictions for each class
+    depressed_probs = predictions[labels == 1]
+    non_depressed_probs = predictions[labels == 0]
+    
+    # Create the plot
+    plt.hist(non_depressed_probs, bins=20, alpha=0.5, label='Non-depressed', color='cornflowerblue')
+    plt.hist(depressed_probs, bins=20, alpha=0.5, label='Depressed', color='lightcoral')
+    
+    # Add threshold line
+    plt.axvline(x=threshold, color='red', linestyle='--', 
+                label=f'Optimal Threshold = {threshold:.4f}')
+    plt.axvline(x=0.5, color='black', linestyle=':', 
+                label='Default Threshold = 0.5')
+    
+    plt.xlabel('Predicted Probability of Depression')
+    plt.ylabel('Count')
+    plt.title('Distribution of Predicted Probabilities by Class')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "probability_distribution.png"), dpi=300)
+    plt.close()
+
+# Helper function for safely converting NumPy types to Python native types for JSON serialization
+def numpy_to_python_type(obj):
+    """Convert NumPy types to Python native types for JSON serialization"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return [numpy_to_python_type(x) for x in obj.tolist()]
+    elif isinstance(obj, dict):
+        return {k: numpy_to_python_type(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [numpy_to_python_type(x) for x in obj]
+    else:
+        return obj
 
 if __name__ == "__main__":
     train()

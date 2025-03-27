@@ -5,8 +5,69 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+class TemporalAttention(nn.Module):
+    """
+    Temporal attention mechanism to focus on important frames in the sequence.
+    
+    This module computes attention weights for each time step in the sequence,
+    allowing the model to focus on the most relevant frames for depression detection.
+    """
+    def __init__(self, hidden_size, attention_size=64):
+        super(TemporalAttention, self).__init__()
+        
+        # Attention projection layers
+        self.query = nn.Linear(hidden_size, attention_size)
+        self.key = nn.Linear(hidden_size, attention_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        
+        # Scoring layer
+        self.score = nn.Linear(attention_size, 1)
+        
+        # Save attention weights for visualization
+        self.last_attention_weights = None
+        
+    def forward(self, x):
+        """
+        Apply temporal attention to focus on important frames
+        
+        Args:
+            x: Input tensor [batch_size, seq_length, hidden_size]
+            
+        Returns:
+            Attended features [batch_size, hidden_size]
+        """
+        batch_size, seq_len, hidden_size = x.shape
+        
+        # Project to query and key spaces
+        q = torch.tanh(self.query(x))  # [batch, seq_len, attn_size]
+        k = torch.tanh(self.key(x))    # [batch, seq_len, attn_size]
+        
+        # Compute attention scores
+        scores = self.score(q + k)     # [batch, seq_len, 1]
+        
+        # Apply softmax to get attention weights
+        attn_weights = F.softmax(scores, dim=1)  # [batch, seq_len, 1]
+        
+        # Save attention weights for visualization
+        self.last_attention_weights = attn_weights.detach()
+        
+        # Apply attention weights to values
+        v = self.value(x)  # [batch, seq_len, hidden_size]
+        
+        # Weighted sum
+        context = torch.bmm(attn_weights.transpose(1, 2), v)  # [batch, 1, hidden_size]
+        attended_features = context.squeeze(1)  # [batch, hidden_size]
+        
+        return attended_features
+    
+    def get_attention_weights(self):
+        """Return the last computed attention weights for visualization"""
+        if self.last_attention_weights is None:
+            return None
+        return self.last_attention_weights
+
 class SimpleCNNEncoder(nn.Module):
-    """Simplified CNN encoder for all features combined"""
+    """Simplified CNN encoder for all features combined with temporal attention"""
     def __init__(self, input_size, hidden_size, seq_length, dropout=0.5, num_conv_layers=3):
         super(SimpleCNNEncoder, self).__init__()
         
@@ -37,8 +98,14 @@ class SimpleCNNEncoder(nn.Module):
             )
             self.conv_layers.append(conv_layer)
         
-        # Global average pooling (simplified from attention pooling)
+        # Add temporal attention for sequence pooling
+        self.temporal_attention = TemporalAttention(hidden_size)
+        
+        # Keep global pool as a fallback option
         self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Store attention weights
+        self.last_attention_weights = None
         
     def forward(self, x):
         """Forward pass
@@ -65,19 +132,23 @@ class SimpleCNNEncoder(nn.Module):
         return x_out
     
     def pool_sequence(self, x):
-        """Pool sequence into a single vector using average pooling
+        """Pool sequence into a single vector using temporal attention
         Args:
             x: Tensor [batch_size, seq_length, hidden_size]
         Returns:
             Pooled representation [batch_size, hidden_size]
         """
-        # Transpose to [batch, hidden_size, seq_len] for pooling
-        x_t = x.transpose(1, 2)
+        # Apply temporal attention to get weighted feature representation
+        attended_features = self.temporal_attention(x)
         
-        # Apply global average pooling
-        pooled = self.global_pool(x_t).squeeze(-1)  # [batch, hidden_size]
+        # Store attention weights for visualization
+        self.last_attention_weights = self.temporal_attention.get_attention_weights()
         
-        return pooled
+        return attended_features
+
+    def get_attention_weights(self):
+        """Return the temporal attention weights"""
+        return self.last_attention_weights
 
 class FeatureGroupBalancer(nn.Module):
     """
@@ -163,8 +234,8 @@ class DepBinaryClassifier(nn.Module):
     def __init__(self, input_size=75, hidden_size=128, num_layers=3, dropout=0.5, seq_length=150,
                  feature_names=None, include_pose=True, pose_scaling_factor=0.5):
         """
-        Binary classification model for depression detection with simplified CNN architecture
-        and feature group balancing.
+        Binary classification model for depression detection with CNN architecture
+        and temporal attention for focusing on important frames.
         
         Args:
             input_size (int): Size of input features
@@ -312,7 +383,11 @@ class DepBinaryClassifier(nn.Module):
         }
 
     def get_attention_weights(self):
-        """Returns empty list since we don't use attention in the simplified model"""
+        """Returns temporal attention weights if available"""
+        if hasattr(self.encoder, 'get_attention_weights'):
+            weights = self.encoder.get_attention_weights()
+            if weights is not None:
+                return [{'layer': 'temporal_attention', 'weights': weights}]
         return []
     
     # Keep the existing feature importance methods for compatibility
@@ -695,4 +770,64 @@ class DepBinaryClassifier(nn.Module):
         if save_path:
             plt.savefig(save_path, dpi=300)
             
+        return plt.gcf()
+    
+    def visualize_temporal_attention(self, x, save_path=None):
+        """
+        Visualize temporal attention weights across sequence
+        
+        Args:
+            x: Input features [batch_size, seq_length, feature_dim]
+            save_path: Path to save the visualization
+            
+        Returns:
+            matplotlib figure
+        """
+        # Get temporal attention weights by running forward pass
+        with torch.no_grad():
+            # Forward pass to compute attention weights
+            _ = self(x)
+            attention_weights = self.encoder.get_attention_weights()
+        
+        if attention_weights is None:
+            raise ValueError("No attention weights available. Run forward pass first.")
+        
+        # Convert to numpy for visualization
+        attention = attention_weights.cpu().numpy().squeeze()  # [seq_len, 1]
+        
+        # Create visualization
+        plt.figure(figsize=(12, 4))
+        
+        # Plot attention weights
+        plt.subplot(1, 1, 1)
+        plt.plot(attention, 'b-', linewidth=2)
+        plt.fill_between(range(len(attention)), 0, attention.flatten(), alpha=0.2, color='blue')
+        
+        # Find important frames (peaks in attention)
+        from scipy.signal import find_peaks
+        peaks, _ = find_peaks(attention.flatten(), height=0.01, distance=5)
+        
+        # Mark important frames
+        if len(peaks) > 0:
+            plt.plot(peaks, attention.flatten()[peaks], "ro", label='Important Frames')
+            plt.legend(loc='upper right')
+        
+        plt.title('Temporal Attention Weights')
+        plt.xlabel('Frame Index')
+        plt.ylabel('Attention Weight')
+        plt.grid(True, alpha=0.3)
+        
+        # Highlight regions with high attention
+        threshold = np.mean(attention) + np.std(attention)
+        high_attention = attention.flatten() > threshold
+        if np.any(high_attention):
+            plt.axhline(y=threshold, color='r', linestyle='--', 
+                      label=f'Significance Threshold ({threshold:.3f})')
+            plt.legend()
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
         return plt.gcf()
