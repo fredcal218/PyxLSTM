@@ -11,7 +11,8 @@ class EDAICDataset(Dataset):
     Dataset class for E-DAIC depression binary classification
     """
     def __init__(self, data_dir, labels_path, split='train', max_seq_length=150, confidence_threshold=0.9, 
-                feature_scalers=None, is_train=False, include_movement_features=True, include_pose=True):
+                feature_scalers=None, is_train=False, include_movement_features=True, 
+                include_pose=True, include_gaze=True, include_au=True):
         """
         Initialize E-DAIC dataset
         
@@ -25,6 +26,8 @@ class EDAICDataset(Dataset):
             is_train (bool): Whether this is the training set (for fitting scalers)
             include_movement_features (bool): Whether to include derived movement features
             include_pose (bool): Whether to include pose features
+            include_gaze (bool): Whether to include gaze features
+            include_au (bool): Whether to include action unit features
         """
         self.data_dir = data_dir
         self.max_seq_length = max_seq_length
@@ -32,8 +35,10 @@ class EDAICDataset(Dataset):
         self.confidence_threshold = confidence_threshold
         self.feature_scalers = feature_scalers
         self.is_train = is_train
-        self.include_movement_features = include_movement_features and include_pose  # Movement features require pose
         self.include_pose = include_pose
+        self.include_gaze = include_gaze
+        self.include_au = include_au
+        self.include_movement_features = include_movement_features and include_pose  # Movement features require pose
         
         # Initialize movement feature extractor only if needed
         if self.include_movement_features:
@@ -79,9 +84,14 @@ class EDAICDataset(Dataset):
                 if col.startswith('pose_'):
                     if self.include_pose:
                         self.feature_names.append(col)
-                # Always include gaze and AU features
-                elif col.startswith('gaze_') or (col.startswith('AU') and not col.endswith('_c')):
-                    self.feature_names.append(col)
+                # Include gaze features if requested
+                elif col.startswith('gaze_'):
+                    if self.include_gaze:
+                        self.feature_names.append(col)
+                # Include AU features if requested (excluding confidence values)
+                elif col.startswith('AU') and not col.endswith('_c'):
+                    if self.include_au:
+                        self.feature_names.append(col)
             
             # If including movement features (requires pose to be included), extract them
             if self.include_movement_features:
@@ -198,7 +208,8 @@ class EDAICDataset(Dataset):
         return self.feature_scalers
 
 def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150, 
-                  confidence_threshold=0.9, include_movement_features=True, include_pose=True):
+                  confidence_threshold=0.9, include_movement_features=True, 
+                  include_pose=True, include_gaze=True, include_au=True):
     """
     Create data loaders for train, dev, and test sets
     
@@ -210,6 +221,8 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150,
         confidence_threshold (float): Minimum confidence for face detection
         include_movement_features (bool): Whether to include derived movement features
         include_pose (bool): Whether to include pose features
+        include_gaze (bool): Whether to include gaze features
+        include_au (bool): Whether to include action unit features
         
     Returns:
         dict: Dictionary of dataloaders and datasets for train, dev, and test sets
@@ -224,7 +237,9 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150,
         feature_scalers=None,  # Will initialize new scalers
         is_train=True,  # Will fit the scalers
         include_movement_features=include_movement_features,
-        include_pose=include_pose
+        include_pose=include_pose,
+        include_gaze=include_gaze,
+        include_au=include_au
     )
     
     # Pre-fit the scalers on all training data
@@ -264,7 +279,9 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150,
         feature_scalers=feature_scalers,
         is_train=False,  # Don't refit, just transform
         include_movement_features=include_movement_features,
-        include_pose=include_pose
+        include_pose=include_pose,
+        include_gaze=include_gaze,
+        include_au=include_au
     )
     
     dev_dataset = EDAICDataset(
@@ -276,7 +293,9 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150,
         feature_scalers=feature_scalers,
         is_train=False,
         include_movement_features=include_movement_features,
-        include_pose=include_pose
+        include_pose=include_pose,
+        include_gaze=include_gaze,
+        include_au=include_au
     )
     
     test_dataset = EDAICDataset(
@@ -288,7 +307,9 @@ def get_dataloaders(data_dir, labels_dir, batch_size=16, max_seq_length=150,
         feature_scalers=feature_scalers,
         is_train=False,
         include_movement_features=include_movement_features,
-        include_pose=include_pose
+        include_pose=include_pose,
+        include_gaze=include_gaze,
+        include_au=include_au
     )
     
     # Print dataset statistics

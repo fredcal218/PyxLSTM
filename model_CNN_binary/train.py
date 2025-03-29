@@ -40,24 +40,27 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Hyperparameters
-BATCH_SIZE = 24
+BATCH_SIZE = 32
 HIDDEN_SIZE = 256
 NUM_LAYERS = 3  # Number of CNN layers
-DROPOUT = 0.3
+DROPOUT = 0.35
 MAX_SEQ_LENGTH = 750  
 LEARNING_RATE = 0.001  # Reduced from 0.01 to 0.001 for stability
 WEIGHT_DECAY = 1e-5    # Added weight decay for regularization
 NUM_EPOCHS = 50
 EARLY_STOPPING_PATIENCE = 15
 INCLUDE_MOVEMENT_FEATURES = False  
-INCLUDE_POSE = False  
+INCLUDE_POSE = False  # Whether to include pose features
+INCLUDE_GAZE = True   # Whether to include gaze features
+INCLUDE_AU = True     # Whether to include action unit features
 POSE_SCALING_FACTOR = 0.1  # More aggressive scaling (reduced from 0.2 to 0.1)
 POSE_REG_STRENGTH = 0.5  # Increased from 0.01 to 0.02 for stronger regularization
 LR_PATIENCE = 4  # Epochs to wait before reducing learning rate
 LR_FACTOR = 0.5  # Factor to reduce learning rate by
-LOSS_TYPE = 'focal'    # Options: 'bce', 'focal'
+LOSS_TYPE = 'bce'    # Options: 'bce', 'focal'
 FOCAL_GAMMA = 2.0      # Focal loss focusing parameter
-FOCAL_ALPHA = 0.75     # Focal loss alpha parameter for positive class weight
+FOCAL_ALPHA = 0.70     # Reduced from 0.75 to decrease weights for positive (depressed) class
+USE_CLINICAL_KNOWLEDGE = True  # Whether to use enhanced clinical feature balancing
 
 # Directories
 DATA_DIR = "E-DAIC/data_extr"
@@ -82,9 +85,12 @@ config = {
     'lr_factor': LR_FACTOR,
     'include_movement_features': INCLUDE_MOVEMENT_FEATURES,
     'include_pose': INCLUDE_POSE,
+    'include_gaze': INCLUDE_GAZE,
+    'include_au': INCLUDE_AU,
     'pose_scaling_factor': POSE_SCALING_FACTOR,
     'pose_reg_strength': POSE_REG_STRENGTH,
     'model_type': 'CNN',  # Changed from LSTM
+    'use_clinical_knowledge': USE_CLINICAL_KNOWLEDGE,  # New parameter
     'device': str(device),
     'loss_type': LOSS_TYPE,
     'focal_gamma': FOCAL_GAMMA,
@@ -157,7 +163,9 @@ def train():
         batch_size=BATCH_SIZE,
         max_seq_length=MAX_SEQ_LENGTH,
         include_movement_features=INCLUDE_MOVEMENT_FEATURES,
-        include_pose=INCLUDE_POSE
+        include_pose=INCLUDE_POSE,
+        include_gaze=INCLUDE_GAZE,
+        include_au=INCLUDE_AU
     )
     
     # Extract loaders and datasets
@@ -186,7 +194,8 @@ def train():
         seq_length=MAX_SEQ_LENGTH,
         feature_names=feature_names,
         include_pose=INCLUDE_POSE,
-        pose_scaling_factor=POSE_SCALING_FACTOR
+        pose_scaling_factor=POSE_SCALING_FACTOR,
+        use_clinical_knowledge=USE_CLINICAL_KNOWLEDGE  # New parameter
     ).to(device)
     
     # Choose loss function based on configuration
@@ -332,8 +341,8 @@ def train():
         history['learning_rate'].append(current_lr)
         
         print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Time: {epoch_time:.2f}s (Loss: {LOSS_TYPE.upper()})")
-        print(f"  Train Loss: {train_loss:.4f}, Acc: {train_metrics['accuracy']:.4f}, F1: {train_metrics['f1']:.4f}, Prec: {train_metrics['precision']:.4f}, Rec: {train_metrics['recall']:.4f}")
-        print(f"  Val Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']:.4f}, F1: {val_metrics['f1']:.4f}, Prec: {val_metrics['precision']:.4f}, Rec: {val_metrics['recall']:.4f}")
+        print(f"  Train Loss: {train_loss:.4f}, Acc: {train_metrics['accuracy']:.4f}, Prec: {train_metrics['precision']:.4f}, Rec: {train_metrics['recall']:.4f}, F1: {train_metrics['f1']:.4f}")
+        print(f"  Val Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']:.4f}, Prec: {val_metrics['precision']:.4f}, Rec: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}")
         print(f"  Learning Rate: {current_lr:.6f}")
         
         # If we're using pose features, log their weights
@@ -868,6 +877,19 @@ def analyze_feature_importance(model, test_loader):
         model.visualize_feature_group_weights(
             save_path=os.path.join(OUTPUT_DIR, "feature_group_weights.png")
         )
+    
+    # If we're using clinical feature balancing, visualize clinical weights
+    if hasattr(model, 'use_clinical_knowledge') and model.use_clinical_knowledge:
+        print("Visualizing clinical feature weights...")
+        if hasattr(model.feature_balancer, 'visualize_clinical_weights'):
+            try:
+                model.feature_balancer.visualize_clinical_weights(
+                    save_path=os.path.join(OUTPUT_DIR, "clinical_feature_weights.png")
+                )
+                print("Clinical feature weights visualization saved.")
+            except Exception as e:
+                print(f"Could not visualize clinical weights: {str(e)}")
+                print("This might be due to using a single modality configuration.")
     
     # Visualize temporal attention for a few examples
     print("Visualizing temporal attention patterns...")
